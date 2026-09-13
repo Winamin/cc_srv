@@ -183,6 +183,20 @@ class Batcher:
         with self.lock:
             pending, self.queued = self.queued, []
         for job in pending:
+            # A prompt that cannot fit one sequence must fail here, with a
+            # reason, rather than reach llama_decode.  A failed decode is not
+            # contained: it does not retire its job, only _retire writes
+            # seq_tokens, so the sequence is left holding tokens the ledger does
+            # not know about -- and the next request placed on it computes its
+            # reusable prefix from that stale ledger and decodes from the wrong
+            # position.  One over-long prompt would take down every request
+            # after it.
+            if len(job.prompt) > self.e.window:
+                job.error = ValueError(
+                    f"prompt is {len(job.prompt)} tokens but a sequence holds "
+                    f"{self.e.window} (n_ctx / nseq); raise --n-ctx")
+                job.finish()
+                continue
             busy = {j.seq for j in self.jobs if j.seq is not None}
             free = [s for s in self.seqs if s not in busy]
 
@@ -434,6 +448,14 @@ class Batcher:
                 job.cur.append(toks[0])
                 job.out.append(token)
                 self._emit(job, token)
+                if job.state != DONE and job.pos >= self.e.window:
+                    # The sequence is full.  Stop this reply here: the next step
+                    # would decode at a position past the cells, which fails the
+                    # whole batch and every other request sharing it, rather than
+                    # just truncating this one.
+                    job.stopped = None
+                    job.text = "".join(job.raw)
+                    job.finish()
 
     def _emit(self, job, token):
         """Append a token's text and apply the stop strings.
@@ -478,11 +500,29 @@ class Batcher:
                 self.wake.clear()
                 self.wake.wait(0.05)
                 continue
+            parts = []
             try:
                 parts = self._plan()
                 if parts:
                     self._advance(parts)
             except BaseException as ex:           # never take the scheduler down
+                # Drop the KV of every sequence in the failed batch.  A decode
+                # that fails does not retire its job, and only _retire writes
+                # seq_tokens, so those sequences hold tokens the ledger has never
+                # heard of.  Keeping them is what turns one bad batch into a
+                # permanent failure: the next admission reads the stale ledger,
+                # believes a prefix is reusable, and decodes from the wrong
+                # position.  Re-prefilling costs a request; not clearing costs
+                # every request after it.
+                for seq in {s for s, _, _, _ in parts}:
+                    try:
+                        self.e.clear_seq(seq)
+                    except Exception:
+                        pass
+                self.st["failed"] = self.st.get("failed", 0) + 1
+                self.log(f"batch failed ({ex!r}); cleared sequences "
+                         f"{sorted({s for s, _, _, _ in parts})}, jobs lost: "
+                         f"{len(parts)}")
                 for j in live:
                     j.error = ex
                     j.finish()

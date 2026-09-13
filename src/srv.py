@@ -218,8 +218,22 @@ def calls_of(text: str):
 
 
 def sse(h, ev: str, data: dict):
-    h.wfile.write(f"event: {ev}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode())
-    h.wfile.flush()
+    """Write one SSE frame.  False once the client is gone.
+
+    A client that hangs up mid-stream raises ConnectionResetError on the next
+    write, and there is no recovering from it -- but the generation loop keeps
+    calling back for every token, so an unguarded write turns one disconnect into
+    a traceback per token.  Latch it instead and go quiet.
+    """
+    if getattr(h, "_gone", False):
+        return False
+    try:
+        h.wfile.write(f"event: {ev}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode())
+        h.wfile.flush()
+        return True
+    except (ConnectionError, OSError):
+        h._gone = True
+        return False
 
 
 def usage(i: int, o: int) -> dict:
@@ -423,7 +437,7 @@ class Api(BaseHTTPRequestHandler):
             # generation thread sends text deltas while this one sends pings --
             # and interleaving two SSE frames corrupts both.
             with emit0:
-                sse(self, ev, data)
+                return sse(self, ev, data)
 
         emit("content_block_start", {"type": "content_block_start", "index": 0,
             "content_block": {"type": "text", "text": ""}})
@@ -463,8 +477,8 @@ class Api(BaseHTTPRequestHandler):
         threading.Thread(target=work, daemon=True).start()
         while not done[0]:                    # ping during generation so an idle watchdog does not cut the stream
             time.sleep(6.0)
-            if not done[0]:
-                emit("ping", {"type": "ping"})
+            if not done[0] and not emit("ping", {"type": "ping"}):
+                break                         # client hung up; nothing left to report to
         if box[1] is not None:
             # The response headers are already sent, so the only honest report is
             # an SSE error event, then close.

@@ -230,6 +230,15 @@ class Eng:
                 f"worker sequences {self.work_seqs}, "
                 f"min prefix {self.arc_min} tokens (nseq={nseq}, n_ctx={n_ctx})")
 
+        # The KV cells are n_ctx in total and llama.cpp divides them across
+        # n_seq_max sequences, so this is how many tokens ONE sequence can hold.
+        # Past it llama_decode fails, and a failed decode leaves the sequences in
+        # that batch holding tokens the ledger does not know about, so the next
+        # admission computes its reusable prefix from stale data and decodes from
+        # the wrong position.  Everything that has to stay inside the window
+        # reads it from here rather than recomputing the division.
+        self.window = n_ctx // nseq
+
         t0 = time.time()
         mp = L.llama_model_default_params(); mp.ngl = 999
         self.mdl = L.llama_model_load_from_file(GGUF.encode(), mp)
