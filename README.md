@@ -211,13 +211,15 @@ prompts, tokens per second:
 The 13% penalty on non-repeating content falls to 3%, and the 2.0x win on
 repeating content holds.
 
-Two limits:
+What decides whether speculation pays is the **accept rate**, not the context
+length. A round that lands its whole draft is roughly 3x faster than decoding one
+token at a time; a round that lands a fraction of it pays two forward passes for
+about one token. `CC_DDC_MAX_CTX` therefore defaults to the sequence's own window
+and never cuts DDC off early — it survives only as the clamp that keeps a draft
+from running past the end of the context.
 
-- **`CC_DDC_MAX_CTX` is 32,768.** Past that prompt length the draft cache stands
-  down by itself: on long-context traffic it measured 0.712x, slower than
-  decoding one token at a time. Claude Code contexts run 25k-50k, so expect it to
-  engage on the small turns and step aside on the large ones. Set `0` for no
-  limit.
+One thing that will stop it:
+
 - **It cannot run with the archive.** DDC verifies drafts on sequence 1 and
   clears it every round, and the archive keeps states in the same spare
   sequences. DDC stands down under `CC_ARCHIVE=1`; setting both by name is
@@ -253,7 +255,7 @@ Everything is an environment variable.
 | `CC_BATCH_WAIT` | 512 | prefix tokens worth giving up to avoid waiting for the busiest worker |
 | `CC_DDC_M` | 32 | draft length cap; the truncation threshold usually binds first |
 | `CC_DDC_T` | 0.5 | draft truncation threshold, lower means longer drafts. At `M=32/T=0.5` drafts run 15 to 22 tokens |
-| `CC_DDC_MAX_CTX` | 32768 | prompt length past which the draft cache stands down; `0` for no limit |
+| `CC_DDC_MAX_CTX` | window | length at which the draft cache stands down; defaults to the sequence's own window, `0` removes the clamp entirely |
 | `CC_SPEC_GOV` | 1 | the gates; `0` speculates whenever a draft exists |
 | `CC_SPEC_MIN` | 12 | rounds of evidence before a draft length is judged |
 | `CC_SPEC_COOLDOWN` | 64 | rounds before a dropped draft length is re-probed; doubles each time |
@@ -286,10 +288,9 @@ workers plus 1 archive slot is `n_ctx` x 4, or 4.8 GB of KV at 131072. Lower
   repeats, and it is a semantic choice rather than a correctness proof: nothing
   re-derives the reply under the context that is current now. Level 2 is the
   sharp edge. Claude Code questions share enough boilerplate that two genuinely
-  different questions score around 0.65 similarity, and at a 0.6 floor it
-  answered one question with a copy of the answer to another on 10 of the 18
-  requests of a live dialog, degenerating it. The floor now defaults to 0.9, and
-  a difference admitting no substitution is refused. If you need every reply
+  different questions can score around 0.65 similarity, so a loose floor answers
+  one question with a copy of the answer to another. The floor defaults to 0.9,
+  and a difference admitting no substitution is refused. If you need every reply
   produced under the current context, leave `CC_QREUSE` at 0.
 - **Reusing the reply to a tool result** (`CC_QREUSE_TOOL=1`) is off because such
   a reply usually contains the tool call that produced the result, so replaying

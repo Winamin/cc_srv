@@ -7,8 +7,8 @@ Field names were already short, so keep them: ctypes aligns by position+type, a 
 import ctypes as ct
 import os
 
-DLL = r"" #DLL
-GGUF = r"" #GGUF
+DLL = r""
+GGUF = r""
 Q4_0 = 2   # KV quantization type. Also the source of the measured "engine output depends on how the KV was built"
 
 

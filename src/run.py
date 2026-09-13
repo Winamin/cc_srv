@@ -103,14 +103,10 @@ token, and it keeps running while DDC is stood down.
 
     Measured on three prompts (two diverse, one repetitive), tokens/sec:
         DDC off                 69.2  69.8   69.6
-        DDC on, no detector     58.1  59.0  128.8
-        DDC on, detector        66.6  67.9  141.5
+        DDC on, gates off       58.1  59.0  128.8
+        DDC on, gates live      66.6  67.9  141.5
     The ~13% diverse penalty becomes ~3% (the grace window is the rest), and the
-    repetitive win survives at 2.0x.  A detector measuring DDC's own output was
-    tried first and failed outright: it reported 0 speculative rounds everywhere
-    and destroyed the win, because the scan it was trying to save is also what
-    builds the index, so standing down froze the index that produced the
-    evidence for standing down.
+    repetitive win survives at 2.0x.
 
 DDC draft cache (on by default; data in DDC_EXPERIMENT.md):
     CC_DDC=0        turn it off
@@ -133,8 +129,12 @@ DDC draft cache (on by default; data in DDC_EXPERIMENT.md):
                     insufficient don't enter the index
     CC_DDC_RESET=1  clear the DDC draft before each actual generation, rebuild
                     only from this request's committed tokens
-    CC_DDC_MAX_CTX=32768  disable DDC once prompt+generated tokens reach this
-                    length, 0 means unlimited
+    CC_DDC_MAX_CTX=<window>  the length at which DDC stands down; defaults to this
+                    sequence's own window (n_ctx / nseq), so it never stands down
+                    early -- it is only the clamp that keeps a draft from running
+                    past the end of the context.  0 removes even that clamp.
+                    Whether speculation pays depends on the accept rate, not the
+                    length, and the gates below measure the accept rate directly.
 """
 import os
 import sys

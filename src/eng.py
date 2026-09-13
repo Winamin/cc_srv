@@ -104,15 +104,13 @@ class Eng:
         # verified by the target model in a batch: the approximate key is a
         # throughput knob, correctness does not rest on it.
         # Verification needs a second sequence, so KV reservation doubles with
-        # nseq -- the copy tax is large on long contexts and measured to be
-        # unprofitable past 60k.
+        # nseq.
         self.ddc = None
-        self.ddc_max_ctx = 32768
+        self.ddc_max_ctx = 0          # set below, once the window is known
         # On by default.  This is the draft cache that makes a long agentic turn
-        # cheap, and two things keep it honest: the per-round gate in spec.py
-        # drops any draft length that stops paying, and ddc_max_ctx stands the
-        # whole thing down on long contexts, where it measured 0.712x -- slower
-        # than decoding one token at a time.
+        # cheap, and what keeps it honest is the per-round gate in spec.py: it
+        # drops any draft length that stops paying, and stands the whole thing
+        # down on content that is not repeating.
         #   CC_DDC=0    off
         #   CC_DDC=2|4  on, with that n-gram key width
         #
@@ -132,9 +130,6 @@ class Eng:
             _k = int(_k)
             if _k not in (2, 4):
                 raise RuntimeError(f"CC_DDC supports only 0, 2 or 4, got {_k!r}")
-            self.ddc_max_ctx = int(os.environ.get("CC_DDC_MAX_CTX", "32768"))
-            if self.ddc_max_ctx < 0:
-                raise ValueError("CC_DDC_MAX_CTX must be >= 0 (0 means unlimited)")
             # Aggressive draft settings on purpose.  Measured on real CC
             # traffic the round's rate rises monotonically with draft length
             # (27 tok/s at 2-3 tokens, 84 at 4-7, 96 at 8-15, 160 at 16+), so
@@ -153,6 +148,22 @@ class Eng:
                 # keeps the main sequence's full window; the price is 2x KV
                 # reservation (2.4 GB at 131072).
                 n_ctx *= 2
+            # Default the cutoff to this sequence's own window, so it never
+            # stands DDC down early; it remains only as the clamp that stops a
+            # draft running past the end of the context.
+            #
+            # What decides whether speculation pays is the accept rate, not the
+            # length.  A round that lands its whole draft is ~3x faster than
+            # decoding one token at a time; a round that lands a fraction of it
+            # pays two forward passes for about one token.  The gates in spec.py
+            # measure that directly, so a static length threshold would be both a
+            # poor proxy and redundant.  The whole-state copy does scale with
+            # length, but it is second-order: ~129 MB at 14k tokens, so ~1.3 ms a
+            # copy at 64k against ~15 ms for a decoded token.
+            _mctx = os.environ.get("CC_DDC_MAX_CTX")
+            self.ddc_max_ctx = (n_ctx // nseq) if _mctx is None else int(_mctx)
+            if self.ddc_max_ctx < 0:
+                raise ValueError("CC_DDC_MAX_CTX must be >= 0 (0 means unlimited)")
             log(f"DDC on k={_k} M={self.ddc.max_draft} "
                 f"T={os.environ.get('CC_DDC_T', '0.5')} gate={self.ddc.gate} "
                 f"reset_per_request={self.ddc.reset_per_request} "

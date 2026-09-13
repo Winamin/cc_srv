@@ -80,19 +80,17 @@ _ON = os.environ.get("CC_SPEC_GOV", "1") != "0"
 # so on content that offers no drafts at all it never accumulates evidence and
 # never arms.  That is precisely the case it is needed for.
 #
-# Why it watches the TOKEN STREAM and not DDC's own output.  The first attempt
-# scored each round by the draft DDC was offered, and it failed outright: the
+# It watches the TOKEN STREAM rather than DDC's own output, and it has to: the
 # full-vocabulary scan in ddc.features is not only the lookup, it is also what
-# feeds cache.append, so standing down to save the scan froze the index, offers
-# stayed at zero, and the detector confirmed itself. Measured: 0 speculative
-# rounds on every request, and the 2x repetitive win (128.8 tok/s) collapsed to
-# 66.1. The evidence and the cost were the same work.
+# feeds cache.append. A detector that measured draft length would be standing
+# down to save the very scan that builds the index the drafts come from, so the
+# index would freeze, offers would stay at zero, and the detector would confirm
+# itself -- the evidence and the cost are the same work.
 #
-# This breaks the circle by measuring repetition where it is cheap -- in the
-# token stream itself. A rolling n-gram over the last few hundred generated
-# tokens costs a tuple hash per token against a 248k-element argpartition
-# (measured at 7.9% of generation time), so it can gate the expensive index
-# without depending on it, and it keeps running while DDC is stood down.
+# A rolling n-gram over the generated token stream breaks that circle: it costs
+# a tuple hash per token against a 248k-element argpartition (measured at 7.9% of
+# generation time), so it can gate the expensive index without depending on it,
+# and it keeps running while DDC is stood down.
 #
 # The signal is deliberately binary per token: an n-gram that occurred before
 # inside the window scores 1, otherwise 0. Novel prose scores near zero; a
