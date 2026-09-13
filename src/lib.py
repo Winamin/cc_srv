@@ -7,8 +7,8 @@ Field names were already short, so keep them: ctypes aligns by position+type, a 
 import ctypes as ct
 import os
 
-DLL = r"D:\test\Zz\NLC\tools\llama-server"
-GGUF = r"D:\AI-model\lmstudio-community\Qwythos-9B-v2-MTP-Q4_K_M\Qwythos-9B-v2-MTP-Q4_K_M.gguf"
+DLL = r"" #DLL
+GGUF = r"" #GGUF
 Q4_0 = 2   # KV quantization type. Also the source of the measured "engine output depends on how the KV was built"
 
 
