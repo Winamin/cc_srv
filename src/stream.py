@@ -85,26 +85,77 @@ class Streamer:
 
     ``holdback`` is the caller's stop strings: a partial one must not be sent
     either, since the buffered path trims the reply at it.
+
+    ``think=True`` surfaces the reasoning instead of dropping it; ``opened``
+    says the prompt already emitted the opening tag, so only ``</think>`` will
+    appear in the model's output.  ``feed`` then
+    returns ``(kind, text)`` pairs -- "thinking" for the region before the first
+    ``</think>``, "text" for everything after -- and the caller puts them in
+    separate content blocks.  The text half runs through exactly the same rules
+    as before, so turning thinking on does not change what the answer looks like.
     """
 
-    def __init__(self, holdback=()):
+    def __init__(self, holdback=(), think=False, opened=False):
         stops = tuple(holdback or ())
         self.cuts = CUTS + stops
         self.parts = PARTS + stops
         self.buf = ""
         self.sent = 0
         self.mismatch = False
+        self.think = think
+        self.tbuf = ""
+        self.tsent = 0
+        # ``opened``: the prompt already ended with the opening tag, so the
+        # model's own output carries only the closing one.  Starting in "probe"
+        # would look for an opening tag that is never coming, decide there is no
+        # reasoning, and stream the whole answer as text.
+        self.tstate = "in" if (think and opened) else ("probe" if think else "done")
 
-    def feed(self, chunk: str) -> str:
-        """Newly safe text, or "" if the chunk did not settle anything."""
+    def feed(self, chunk):
+        """Newly safe ``(kind, text)`` pairs, or [] if nothing settled."""
         if not chunk:
-            return ""
+            return []
         self.buf += chunk
+        out = []
+        if self.think and self.tstate != "done":
+            t = self._think_step()
+            if t:
+                out.append(("thinking", t))
+            if self.tstate != "done":
+                return out          # still inside the reasoning
         safe = self._safe_prefix()
-        if len(safe) <= self.sent:
+        if len(safe) > self.sent:
+            out.append(("text", safe[self.sent:]))
+            self.sent = len(safe)
+        return out
+
+    def _think_step(self) -> str:
+        """Drain what is safe of the think region.  "" if nothing new.
+
+        Three states, because a reply that never opens with <think> has no
+        reasoning at all and must not be mistaken for one: "probe" holds the
+        first bytes while they could still be the opener, then commits.
+        """
+        op, end = "<think>", "</think>"
+        if self.tstate == "probe":
+            if len(self.buf) < len(op) and op.startswith(self.buf):
+                return ""               # still could turn into the opener
+            if not self.buf.startswith(op):
+                self.tstate = "done"    # no reasoning here; the rest is the answer
+                return ""
+            self.buf = self.buf[len(op):]
+            self.tstate = "in"
+        i = self.buf.find(end)
+        if i >= 0:
+            body, self.buf = self.buf[:i], self.buf[i + len(end):]
+            self.tstate = "done"
+        else:
+            # Hold back a tail that could still be the closing tag.
+            body = self.buf[:len(self.buf) - partial_tail(self.buf, (end,))]
+        if len(body) <= self.tsent:
             return ""
-        new = safe[self.sent:]
-        self.sent = len(safe)
+        new = body[self.tsent:]
+        self.tsent = len(body)
         return new
 
     def _safe_prefix(self) -> str:
@@ -118,7 +169,9 @@ class Streamer:
         # Hold back a tail that might still turn into a marker.
         region = region[:len(region) - partial_tail(region, self.parts)]
         # Then the think blocks, then the strip the buffered path applies.
-        return strip_think(region).strip()
+        # In think mode the block is already behind us, so there is nothing left
+        # to remove -- the text half is identical either way.
+        return (region if self.think else strip_think(region)).strip()
 
     def finish(self, final_text: str) -> str:
         """The remainder, so that everything sent adds up to ``final_text``.
