@@ -29,7 +29,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from batch import Batcher, run_job
 from eng import Eng
-from log import log, setup as log_setup
+from log import C, log, setup as log_setup
 from qcache import turn_key
 from stream import Streamer
 
@@ -236,9 +236,24 @@ def sse(h, ev: str, data: dict):
         return False
 
 
-def usage(i: int, o: int) -> dict:
-    return {"input_tokens": i, "output_tokens": o,
-            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
+def usage(i: int, o: int, cache_read: int = 0) -> dict:
+    """Anthropic usage, with the cache fields filled in.
+
+    Claude Code does not ask the server whether the cache hit -- it records
+    whatever these fields say into its session transcript, and every tool that
+    reports a hit rate (the statusline payload, cc-live, claude-stat) computes
+    it from that transcript.  Reporting zero here means the hit rate reads as
+    zero however much the local cache actually served.
+
+    The three input fields have to add up to the prompt: ``input_tokens`` is
+    what was billed as fresh input and ``cache_read_input_tokens`` is what the
+    cache answered.  cc_srv has no separate write-to-cache step -- every
+    forwarded token also lands in the KV -- so ``cache_creation_input_tokens``
+    stays 0 and the forwarded count is reported as plain input rather than
+    being counted twice.
+    """
+    return {"input_tokens": max(0, i - cache_read), "output_tokens": o,
+            "cache_creation_input_tokens": 0, "cache_read_input_tokens": cache_read}
 
 
 def prepare(req):
@@ -337,7 +352,7 @@ class Api(BaseHTTPRequestHandler):
         mid = "msg_" + uuid.uuid4().hex[:24]
         stops += ["<|im_end|>", "<|endoftext|>", "<|im_start|>"]   # template control tokens are natural stop strings
 
-        def run(on_token=None):
+        def run(on_token=None, on_serve=None):
             t = time.time()
             if BATCHER is not None:
                 # The scheduler already runs requests concurrently; a lock here
@@ -346,7 +361,7 @@ class Api(BaseHTTPRequestHandler):
                 t0 = time.time()
                 pre_before, gen_before = E.st["t_pre"], E.st["t_gen"]
                 arc_before = E.st.get("arc_s", 0.0)
-                r = run_job(E, BATCHER, ids, mx, stops, turn, on_token)
+                r = run_job(E, BATCHER, ids, mx, stops, turn, on_token, on_serve)
             else:
                 with LK:
                     w = time.time() - t
@@ -357,7 +372,7 @@ class Api(BaseHTTPRequestHandler):
                     pre_before, gen_before = E.st["t_pre"], E.st["t_gen"]
                     arc_before = E.st.get("arc_s", 0.0)
                     r = E.gen(ids, max_new=mx, stop=stops, turn=turn,
-                              on_token=on_token)
+                              on_token=on_token, on_serve=on_serve)
             if os.environ.get("CC_DUMP"):
                 with open(os.environ["CC_DUMP"], "a", encoding="utf-8") as f:
                     f.write(json.dumps({"prompt": list(ids), "gen": list(r[0]),
@@ -381,20 +396,42 @@ class Api(BaseHTTPRequestHandler):
                 gn = E.st["t_gen"] - gen_before
             arcd = E.st.get("arc_s", 0.0) - arc_before
             sec = time.time() - t0
-            # Prefill rate: tokens actually forwarded, over the time spent
-            # forwarding them.  This is the number to compare against the ~2,000
-            # tok/s a solo prefill manages, and the one that shows a request
-            # pinned behind its neighbours.
+            # Whatever the two counters did not claim.  A batched request is only
+            # advanced on the steps it appears in, and _admit can put it straight
+            # back on the queue to wait for the worker holding its history -- so
+            # without this bucket prefill+decode do not add up to the wall clock
+            # and the prefill rate below reads far better than the request felt.
+            wait = max(0.0, sec - pf - gn - arcd)
+            # Four different speeds, because they answer four different
+            # questions and only the first is comparable to a solo prefill:
+            #   pre/s  tokens actually forwarded, per second spent forwarding
+            #   ctx/s  the whole prompt, per second spent forwarding -- the cache's
+            #          contribution included, so a restored prefix shows up here
+            #   gen/s  the model's own decode rate, over decode time alone
+            #   out/s  what the caller waited for: output over the whole request
             pre_n = info.get("pre") or 0
-            rate = f" {pre_n / pf:.0f}pre/s" if (pre_n and pf and pf > 0) else ""
-            msg = (f"{len(ids)}+{len(r[0])} {info['hit']} "
+            out_n = len(r[0])
+            rates = []
+            if pf > 0:
+                if pre_n:
+                    rates.append(f"{pre_n / pf:.0f}pre/s")
+                if ids:
+                    rates.append(f"{len(ids) / pf:.0f}ctx/s")
+            if gn > 0 and out_n:
+                rates.append(f"{out_n / gn:.0f}gen/s")
+            if sec > 0 and out_n:
+                rates.append(f"{out_n / sec:.0f}out/s")
+            hit_c = "red" if info["hit"] == "batch_cold" else "green"
+            msg = (f"{len(ids)}+{out_n} {C(info['hit'], hit_c)} "
                    f"pre={info.get('pre')} reuse={info.get('reuse')} "
                    f"p_raw={info.get('p_raw','-')} cur={info.get('cur','-')} "
-                   f"{sec:.1f}s (prefill {pf:.1f}s + decode {gn:.1f}s){rate}")
+                   f"{sec:.1f}s (prefill {pf:.1f}s + decode {gn:.1f}s")
+            if wait > 0.05:
+                msg += f" + {C('wait', 'yellow')} {wait:.1f}s"
+            msg += ")"
+            if rates:
+                msg += " " + " ".join(rates)
             if arcd > 0.001:
-                # Only on requests that actually restored; it is the one cost the
-                # archive adds, and whether it is worth a low-reuse hit is the
-                # question this answers.
                 msg += f" arc_restore={arcd:.2f}s"
             if turn is not None:
                 msg += f" turn={turn[0]}:{turn[1].hex()[:8]}"
@@ -442,7 +479,8 @@ class Api(BaseHTTPRequestHandler):
             return self._send(200, {"id": mid, "type": "message", "role": "assistant",
                                     "model": mdl, "content": c, "stop_reason": why,
                                     "stop_sequence": None,
-                                    "usage": usage(len(ids), len(toks))})
+                                    "usage": usage(len(ids), len(toks),
+                                                   info.get("reuse") or 0)})
 
         # ---- streaming ----
         self.send_response(200)
@@ -450,21 +488,43 @@ class Api(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
         self.end_headers()
-        sse(self, "message_start", {"type": "message_start", "message": {
-            "id": mid, "type": "message", "role": "assistant", "model": mdl,
-            "content": [], "stop_reason": None, "stop_sequence": None,
-            "usage": usage(len(ids), 0)}})
+        # message_start is NOT sent here.  Its usage is what Claude Code writes
+        # into the session transcript, and the cache fields in it can only be
+        # right if the serving layer is already known -- which it is not yet:
+        # the probe and the scheduler both decide later, and both decide before
+        # a single token is produced.  So it goes out at the first of those
+        # moments, or at the latest before any content frame.
+        served = {"reuse": 0, "sent": False}
         emit0 = threading.Lock()
+
+        def ensure_start():
+            """Write message_start and the opening text block once.  Caller holds emit0."""
+            if served["sent"]:
+                return
+            served["sent"] = True
+            sse(self, "message_start", {"type": "message_start", "message": {
+                "id": mid, "type": "message", "role": "assistant", "model": mdl,
+                "content": [], "stop_reason": None, "stop_sequence": None,
+                "usage": usage(len(ids), 0, served["reuse"])}})
+            # content_block_start travels with it: it used to be emitted up front,
+            # which forced message_start out before the serving layer was known
+            # and put a zero in the cache fields the client records.
+            sse(self, "content_block_start", {"type": "content_block_start",
+                "index": 0, "content_block": {"type": "text", "text": ""}})
+
+        def on_serve(reuse, hit):
+            served["reuse"] = reuse or 0
+            with emit0:
+                ensure_start()
 
         def emit(ev, data):
             # The generation thread and this one both write to the socket -- the
             # generation thread sends text deltas while this one sends pings --
             # and interleaving two SSE frames corrupts both.
             with emit0:
+                ensure_start()        # never let content precede message_start
                 return sse(self, ev, data)
 
-        emit("content_block_start", {"type": "content_block_start", "index": 0,
-            "content_block": {"type": "text", "text": ""}})
         st = Streamer(stops) if STREAM else None
 
         def on_tok(chunk):
@@ -483,30 +543,29 @@ class Api(BaseHTTPRequestHandler):
                 emit("content_block_delta", {"type": "content_block_delta",
                      "index": 0, "delta": {"type": "text_delta", "text": safe}})
 
-        box, done = [None, None], [False]
+        box, done = [None, None], threading.Event()
 
         def work():
             # try/finally, not a bare pair: without it a raise inside run() left
-            # done[0] False forever, so the handler below pinged every 6 s and
+            # the flag unset forever, so the handler below pinged every 6 s and
             # never reached message_stop -- and those pings keep the client's
             # idle watchdog alive, so the client waited indefinitely instead of
             # erroring.  The exception is carried out and reported below.
             try:
-                box[0] = run(on_tok)
+                box[0] = run(on_tok, on_serve)
             except BaseException as ex:       # noqa: BLE001 - reported below
                 box[1] = ex
             finally:
-                done[0] = True
+                done.set()
 
         threading.Thread(target=work, daemon=True).start()
-        while not done[0]:                    # ping during generation so an idle watchdog does not cut the stream
-            time.sleep(6.0)
-            if not done[0]:
-                # A no-op once the client has gone -- sse() latches the disconnect
-                # instead of raising.  It must NOT break out of this loop: the
-                # worker thread may still be running, and box[0] is unpacked
-                # below, so leaving early reads None and dies on the unpack.
-                emit("ping", {"type": "ping"})
+        # Event.wait returns the moment the flag is set, so a reply goes out as
+        # soon as it exists.  Polling with a bare time.sleep(6.0) instead -- the
+        # earlier shape -- slept the full timeout BEFORE looking, which pushed
+        # every reply to the next 6 s boundary: a cache hit answered in 1 ms
+        # still reached the client 6 s later.
+        while not done.wait(6.0):
+            emit("ping", {"type": "ping"})    # keep an idle watchdog from cutting the stream
         if box[1] is not None:
             # The response headers are already sent, so the only honest report is
             # an SSE error event, then close.
@@ -515,12 +574,18 @@ class Api(BaseHTTPRequestHandler):
             self.close_connection = True
             return
         if box[0] is None:
-            # Unreachable while the loop above waits for done[0]: work() sets
+            # Unreachable while the loop above waits on done: work() sets
             # box[0] or box[1] in every path.  Asserted so that anything which
             # leaves that loop early fails here with a reason, instead of dying
             # on the unpack with "cannot unpack non-sequence NoneType".
             raise RuntimeError("generation finished without a result")
         toks, text, info = box[0]
+        # Everything below writes frames directly, so make sure message_start has
+        # gone out first.  It normally has by now (on_serve fired at admission,
+        # or the first delta went through emit), but a reply that produced no
+        # streamed text at all would otherwise reach message_delta without it.
+        with emit0:
+            ensure_start()
 
         # Everything is sent after generation completes, not while generating --
         # tool blocks cannot be streamed character by character or CC sees half a
@@ -552,7 +617,12 @@ class Api(BaseHTTPRequestHandler):
             sse(self, "content_block_stop", {"type": "content_block_stop", "index": i})
         sse(self, "message_delta", {"type": "message_delta",
             "delta": {"stop_reason": "tool_use" if calls else "end_turn",
-                      "stop_sequence": None}, "usage": usage(0, len(toks))})
+                      "stop_sequence": None},
+            # Repeats the whole usage rather than just output_tokens.  Claude
+            # Code is known to record the fields from message_start; this one
+            # carries the same numbers so a reader that prefers the last usage
+            # in the stream sees them too.
+            "usage": usage(len(ids), len(toks), info.get("reuse") or 0)})
         sse(self, "message_stop", {"type": "message_stop"})
         # An SSE response has neither Content-Length nor chunked encoding, so
         # under HTTP/1.1 the client can only tell the response ended by the

@@ -55,12 +55,18 @@ class Job:
     __slots__ = ("prompt", "max_new", "stop", "turn", "seq", "cur", "pos",
                  "out", "raw", "text", "hit", "state", "cursor", "stopped",
                  "done", "result", "error", "t0", "prefilled", "reused",
-                 "arc_at", "arc_done", "on_token", "pf_s", "gn_s")
+                 "arc_at", "arc_done", "on_token", "pf_s", "gn_s", "on_serve")
 
-    def __init__(self, prompt, max_new, stop, turn=None, on_token=None):
+    def __init__(self, prompt, max_new, stop, turn=None, on_token=None,
+                 on_serve=None):
         # Called with each generated token's text as it is produced, so a caller
         # can stream.  None means the reply is only available at the end.
         self.on_token = on_token
+        # Called once, as soon as the serving layer is decided, with
+        # (reused, hit).  The scheduler knows this at admission -- long before
+        # the reply exists -- and the HTTP layer needs it that early because the
+        # usage it puts in message_start is what Claude Code records.
+        self.on_serve = on_serve
         self.prompt = list(prompt)
         self.max_new = max_new
         self.stop = list(stop or ())
@@ -149,8 +155,9 @@ class Batcher:
             self.thread.start()
 
     # ---------------- public ----------------
-    def submit(self, prompt, max_new, stop, turn=None, on_token=None) -> Job:
-        job = Job(prompt, max_new, stop, turn, on_token)
+    def submit(self, prompt, max_new, stop, turn=None, on_token=None,
+               on_serve=None) -> Job:
+        job = Job(prompt, max_new, stop, turn, on_token, on_serve)
         with self.lock:
             self.queued.append(job)
             self.st["jobs"] += 1
@@ -321,6 +328,11 @@ class Batcher:
         # exactly the three outcomes the archive work is trying to move between.
         job.hit = ("batch_arc" if how == "arc"
                    else "batch_apc" if reused else "batch_cold")
+        # Report the decision now, not at retirement.  Everything above happens
+        # before a single token of this request is produced, which is the whole
+        # reason the hook exists here rather than on the finished job.
+        if job.on_serve is not None:
+            job.on_serve(job.reused, job.hit)
         self.jobs.append(job)
         self.st["admitted"] += 1
         self.st[how] = self.st.get(how, 0) + 1
@@ -568,7 +580,8 @@ class Batcher:
                 f"jobs={s['jobs']} admitted={s['admitted']} peak={s['peak_seq']}")
 
 
-def run_job(engine, batcher, prompt, max_new, stop, turn=None, on_token=None):
+def run_job(engine, batcher, prompt, max_new, stop, turn=None, on_token=None,
+            on_serve=None):
     """Serve one request: the KV-free layers first, then the batcher.
 
     This is the whole serving path.  A request that any exact layer can answer
@@ -582,10 +595,14 @@ def run_job(engine, batcher, prompt, max_new, stop, turn=None, on_token=None):
     st["req"] += 1
     stopk = tuple(stop or ())
     with batcher.state_lock:
-        hit = probe(e, prompt, max_new, stop or [], stopk, turn)
+        # on_token is passed through: the serial path already does (eng.py, in
+        # gen), and without it a hit on any of these three layers emits nothing
+        # while "generating", so the whole reply lands in one block at the end
+        # instead of streaming.  Same reply either way, different experience.
+        hit = probe(e, prompt, max_new, stop or [], stopk, turn, on_token, on_serve)
     if hit is not None:
         return hit
-    job = batcher.submit(prompt, max_new, stop or [], turn, on_token)
+    job = batcher.submit(prompt, max_new, stop or [], turn, on_token, on_serve)
     if not job.done.wait(timeout=1800):
         raise TimeoutError("batcher did not finish the job")
     if job.error is not None:

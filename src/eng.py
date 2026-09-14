@@ -35,7 +35,7 @@ from lib import Mp, Cp, Msg, Batch, GGUF, Q4_0, bind
 
 
 def probe(e, pids: list[int], max_new: int, stop: list[str], stopk: tuple,
-          turn=None, on_token=None):
+          turn=None, on_token=None, on_serve=None):
     """Try every layer that needs no KV work.  Returns gen()'s triple, or None.
 
     These are the exact-prompt logits cache, trajectory recall, and the
@@ -50,6 +50,12 @@ def probe(e, pids: list[int], max_new: int, stop: list[str], stopk: tuple,
 
     The order is deliberate: the two exact layers are sound, and the turn-keyed
     layer is a semantic choice, so it goes last.
+
+    ``on_serve(reused, hit)`` is reported BEFORE ``on_token`` on every hit.  A
+    hit here reuses the whole prompt and then hands over the text in one call,
+    so reporting afterwards would have the text -- and with it message_start --
+    reach the client before the reuse was known, and the start frame is exactly
+    where the client reads the cache fields from.
     """
     st = e.st
     # 1) Whole prompt identical -> logits cache.  Entries store the TEXT and not
@@ -66,6 +72,8 @@ def probe(e, pids: list[int], max_new: int, stop: list[str], stopk: tuple,
                 text = "".join(e.piece(t) for t in toks)
             else:
                 toks, text = toks_, text_
+            if on_serve:
+                on_serve(len(pids), "lgc")
             if on_token:
                 on_token(text)
             return toks, text, {"hit": "lgc", "pre": 0, "reuse": len(pids)}
@@ -74,6 +82,8 @@ def probe(e, pids: list[int], max_new: int, stop: list[str], stopk: tuple,
     #    a prefix of some recorded trajectory).
     r = e.recall(pids, max_new, stop)
     if r is not None:
+        if on_serve:
+            on_serve(r[2].get("reuse") or len(pids), r[2].get("hit") or "rcl")
         if on_token:
             on_token(r[1])
         return r
@@ -81,8 +91,24 @@ def probe(e, pids: list[int], max_new: int, stop: list[str], stopk: tuple,
     # 3) Turn-keyed reuse.
     qc = getattr(e, "qc", None)
     if qc is not None:
-        r = e.qreuse(pids, max_new, stop, stopk, turn, on_token)
+        # A qreuse hit also answers with the whole prompt reused, but the layer
+        # decides that itself and calls on_token from inside -- so the report is
+        # wrapped onto that call rather than made after it returns.
+        served = []
+
+        def _tok(chunk, _t=on_token):
+            if on_serve and not served:
+                served.append(1)
+                on_serve(len(pids), "qreuse")
+            if _t:
+                _t(chunk)
+
+        r = e.qreuse(pids, max_new, stop, stopk, turn,
+                     _tok if (on_token or on_serve) else None)
         if r is not None:
+            if on_serve and not served:
+                served.append(1)
+                on_serve(r[2].get("reuse") or len(pids), "qreuse")
             return r
     return None
 
@@ -1188,12 +1214,18 @@ class Eng:
 
     # ---------------- main entry point ----------------
     def gen(self, pids: list[int], max_new: int = 512, stop: list[str] | None = None,
-            on_token=None, turn=None):
+            on_token=None, turn=None, on_serve=None):
         """-> (toks, text, info).  on_token(piece) is used for streaming.
 
         ``turn`` is the qcache.turn_key() of the request this prompt came from.
         The engine only sees tokens, so the caller has to pass it; without it the
         turn-keyed layer is inert.
+
+        ``on_serve(reused, hit)`` fires as soon as the serving layer is decided,
+        which is before any token is produced.  The HTTP layer needs it that
+        early: the usage it puts in message_start is what Claude Code records,
+        and a hit that is only reported at the end would reach the client after
+        it had already written down zero.
         """
         stop = stop or []
         st = self.st
@@ -1209,7 +1241,7 @@ class Eng:
         #    in front of its scheduler, because a hit here never has to occupy a
         #    sequence.
         key = self.key(pids)          # gen() files its own result under this later
-        r = probe(self, pids, max_new, stop, stopk, turn, on_token)
+        r = probe(self, pids, max_new, stop, stopk, turn, on_token, on_serve)
         if r is not None:
             return r
 
@@ -1255,6 +1287,10 @@ class Eng:
                 p = 0
         new = pids[p:]
         st["reuse"] += p; st["pre"] += len(new)
+        if on_serve is not None:
+            # p is final here and nothing has been generated yet, so this is the
+            # last moment the HTTP layer can still get it into message_start.
+            on_serve(p, "apc" if p else "cold")
         if p > 0:
             st["apc"] += 1
         t0 = time.time()

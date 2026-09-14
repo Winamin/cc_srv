@@ -26,6 +26,7 @@ single long message across several callbacks.
 """
 from __future__ import annotations
 
+import re
 import ctypes as ct
 import os
 import sys
@@ -45,6 +46,45 @@ _to_console = os.environ.get("CC_LOG_CONSOLE", "1") != "0"
 _path = None
 _cb = None            # the ctypes callback; the C side holds only a pointer, so
                       # this reference is what keeps it from being collected
+
+# Colour goes to the console only -- the file is stripped on the way out (see
+# _emit), so a saved log stays greppable and diffable.  Off when the output is
+# redirected, when the terminal cannot do ANSI, or with CC_LOG_COLOR=0.
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+COLOURS = {"dim": "2", "red": "31", "green": "32", "yellow": "33",
+           "blue": "34", "magenta": "35", "cyan": "36", "grey": "90",
+           "bright_red": "91", "bright_green": "92", "bright_yellow": "93"}
+
+
+def _vt_ok():
+    """Whether this console understands ANSI escapes."""
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        h = k.GetStdHandle(-11)                    # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if not k.GetConsoleMode(h, ctypes.byref(mode)):
+            return False
+        return bool(k.SetConsoleMode(h, mode.value | 0x0004))   # VT processing
+    except Exception:
+        return False
+
+
+try:
+    _color = (os.environ.get("CC_LOG_COLOR", "1") != "0"
+              and _to_console and sys.stdout.isatty() and _vt_ok())
+except Exception:
+    _color = False
+
+
+def C(text, colour: str) -> str:
+    """Colour a fragment for the console.  A no-op when colour is off, so
+    callers never have to branch on it."""
+    if not _color or not colour:
+        return str(text)
+    return f"\x1b[{COLOURS.get(colour, '0')}m{text}\x1b[0m"
 
 
 def setup(logdir: str | None = None, tag: str = "cc_srv"):
@@ -66,9 +106,13 @@ def _emit(line: str, console: bool = True):
         try:
             os.makedirs(os.path.dirname(_path), exist_ok=True)
             with _lock, open(_path, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
+                f.write(_ANSI.sub("", line) + "\n")
         except Exception:
             pass
+
+
+_LEVEL_COLOUR = {"info": "cyan", "warn": "yellow", "warning": "yellow",
+                 "error": "red", "debug": "dim"}
 
 
 def log(msg: str, level: str = "info", tag: str = "cc_srv"):
@@ -76,8 +120,10 @@ def log(msg: str, level: str = "info", tag: str = "cc_srv"):
     if LEVELS.get(level, 20) < _threshold:
         return
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    lv = level.upper()
+    badge = C(f"[{lv:5s}]", _LEVEL_COLOUR.get(level, "cyan"))
     for line in str(msg).splitlines() or [""]:
-        _emit(f"{stamp} [{level.upper():5s}] [{tag}] {line}")
+        _emit(f"{C(stamp, 'grey')} {badge} {C('[' + tag + ']', 'dim')} {line}")
 
 
 # ---------------- llama.cpp / ggml ----------------
