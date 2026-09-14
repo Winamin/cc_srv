@@ -55,7 +55,7 @@ class Job:
     __slots__ = ("prompt", "max_new", "stop", "turn", "seq", "cur", "pos",
                  "out", "raw", "text", "hit", "state", "cursor", "stopped",
                  "done", "result", "error", "t0", "prefilled", "reused",
-                 "arc_at", "arc_done", "on_token")
+                 "arc_at", "arc_done", "on_token", "pf_s", "gn_s")
 
     def __init__(self, prompt, max_new, stop, turn=None, on_token=None):
         # Called with each generated token's text as it is produced, so a caller
@@ -82,6 +82,12 @@ class Job:
         self.arc_at = None
         self.arc_done = False
         self.stopped = None
+        # Wall time this request spent prefilling vs decoding.  Accumulated per
+        # job because a batch serves several at once: one llama_decode covers
+        # every part, so there is no separate clock to read and the engine-level
+        # counters cannot tell one request's prefill from its neighbours'.
+        self.pf_s = 0.0
+        self.gn_s = 0.0
         self.done = threading.Event()
         self.result = None
         self.error = None
@@ -406,6 +412,7 @@ class Batcher:
     def _advance(self, parts):
         """Decode one step for every part and give each job its own logits row."""
         e, L = self.e, self.e.L
+        t_step = time.perf_counter()
         b, keep, idx = e.batch_parts([(s, p, t) for s, p, t, _ in parts])
         if L.llama_decode(e.ctx, b) != 0:
             import os as _os
@@ -427,6 +434,11 @@ class Batcher:
         self.st["steps"] += 1
         self.st["batched_tokens"] += b.n_tokens
         self.st["peak_seq"] = max(self.st["peak_seq"], len(parts))
+        # Captured before the loop below, which flips a finished prefill to
+        # DECODE -- reading state afterwards would file the last chunk of every
+        # prompt as decode time.
+        was_prefill = [job.state == PREFILL for _, _, _, job in parts]
+        n_tok = sum(len(t) for _, _, t, _ in parts)
         for k, (seq, pos0, toks, job) in enumerate(parts):
             row = e.logits_row(idx[k])
             token = int(row.argmax())
@@ -456,6 +468,26 @@ class Batcher:
                     job.stopped = None
                     job.text = "".join(job.raw)
                     job.finish()
+
+        # Split the step's wall time across its parts by token count.  A prefill
+        # chunk is up to a hundred tokens and a decode is one, so token share is
+        # what the step's cost tracks; charging the whole step to each part would
+        # report a decode pinned behind a prefill as prefill time.
+        dt = time.perf_counter() - t_step
+        if n_tok:
+            n_pre = 0
+            for pre, (_, _, toks, job) in zip(was_prefill, parts):
+                share = dt * len(toks) / n_tok
+                if pre:
+                    job.pf_s += share
+                    n_pre += len(toks)
+                else:
+                    job.gn_s += share
+            # Keep the engine-level counters meaningful too: the batched path
+            # never moved them, so every batched request logged a split of
+            # "prefill 0.0s + decode 0.0s".
+            self.e.st["t_pre"] += dt * n_pre / n_tok
+            self.e.st["t_gen"] += dt * (n_tok - n_pre) / n_tok
 
     def _emit(self, job, token):
         """Append a token's text and apply the stop strings.
@@ -564,5 +596,5 @@ def run_job(engine, batcher, prompt, max_new, stop, turn=None, on_token=None):
     info = {"hit": job.hit, "pre": job.prefilled - job.reused,
             "reuse": job.reused, "cur": len(job.cur),
             "stop": job.stopped, "trunc": job.stopped is None,
-            "seq": job.seq}
+            "seq": job.seq, "pf": job.pf_s, "gn": job.gn_s}
     return job.out, job.text, info

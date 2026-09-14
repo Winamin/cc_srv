@@ -345,6 +345,7 @@ class Api(BaseHTTPRequestHandler):
                 # KV-free layers are reached inside run_job, which guards them.
                 t0 = time.time()
                 pre_before, gen_before = E.st["t_pre"], E.st["t_gen"]
+                arc_before = E.st.get("arc_s", 0.0)
                 r = run_job(E, BATCHER, ids, mx, stops, turn, on_token)
             else:
                 with LK:
@@ -354,6 +355,7 @@ class Api(BaseHTTPRequestHandler):
                               f"(single context, serial)", "warn")
                     t0 = time.time()
                     pre_before, gen_before = E.st["t_pre"], E.st["t_gen"]
+                    arc_before = E.st.get("arc_s", 0.0)
                     r = E.gen(ids, max_new=mx, stop=stops, turn=turn,
                               on_token=on_token)
             if os.environ.get("CC_DUMP"):
@@ -366,12 +368,34 @@ class Api(BaseHTTPRequestHandler):
             # 25k and generated 76 -- measured: 12.3 s against 11.8 s, with the
             # reuse actually saving 8.2 s.  Without the split that reads as "the
             # cache made it slower", which is how it got read.
-            pf = E.st["t_pre"] - pre_before
-            gn = E.st["t_gen"] - gen_before
+            # The batched path reports these per request.  A batch serves several
+            # requests in one llama_decode, so the engine-level counters cannot
+            # separate them and the deltas below would credit this request with
+            # its neighbours' prefill time; the serial path has no per-job figure
+            # and falls back to the deltas, which are exact there.
+            pf = info.get("pf")
+            gn = info.get("gn")
+            if pf is None:
+                pf = E.st["t_pre"] - pre_before
+            if gn is None:
+                gn = E.st["t_gen"] - gen_before
+            arcd = E.st.get("arc_s", 0.0) - arc_before
+            sec = time.time() - t0
+            # Prefill rate: tokens actually forwarded, over the time spent
+            # forwarding them.  This is the number to compare against the ~2,000
+            # tok/s a solo prefill manages, and the one that shows a request
+            # pinned behind its neighbours.
+            pre_n = info.get("pre") or 0
+            rate = f" {pre_n / pf:.0f}pre/s" if (pre_n and pf and pf > 0) else ""
             msg = (f"{len(ids)}+{len(r[0])} {info['hit']} "
                    f"pre={info.get('pre')} reuse={info.get('reuse')} "
                    f"p_raw={info.get('p_raw','-')} cur={info.get('cur','-')} "
-                   f"{time.time()-t0:.1f}s (prefill {pf:.1f}s + decode {gn:.1f}s)")
+                   f"{sec:.1f}s (prefill {pf:.1f}s + decode {gn:.1f}s){rate}")
+            if arcd > 0.001:
+                # Only on requests that actually restored; it is the one cost the
+                # archive adds, and whether it is worth a low-reuse hit is the
+                # question this answers.
+                msg += f" arc_restore={arcd:.2f}s"
             if turn is not None:
                 msg += f" turn={turn[0]}:{turn[1].hex()[:8]}"
             if info["hit"] == "qreuse":
@@ -477,8 +501,12 @@ class Api(BaseHTTPRequestHandler):
         threading.Thread(target=work, daemon=True).start()
         while not done[0]:                    # ping during generation so an idle watchdog does not cut the stream
             time.sleep(6.0)
-            if not done[0] and not emit("ping", {"type": "ping"}):
-                break                         # client hung up; nothing left to report to
+            if not done[0]:
+                # A no-op once the client has gone -- sse() latches the disconnect
+                # instead of raising.  It must NOT break out of this loop: the
+                # worker thread may still be running, and box[0] is unpacked
+                # below, so leaving early reads None and dies on the unpack.
+                emit("ping", {"type": "ping"})
         if box[1] is not None:
             # The response headers are already sent, so the only honest report is
             # an SSE error event, then close.
@@ -486,6 +514,12 @@ class Api(BaseHTTPRequestHandler):
                            "error": {"type": "api_error", "message": str(box[1])}})
             self.close_connection = True
             return
+        if box[0] is None:
+            # Unreachable while the loop above waits for done[0]: work() sets
+            # box[0] or box[1] in every path.  Asserted so that anything which
+            # leaves that loop early fails here with a reason, instead of dying
+            # on the unpack with "cannot unpack non-sequence NoneType".
+            raise RuntimeError("generation finished without a result")
         toks, text, info = box[0]
 
         # Everything is sent after generation completes, not while generating --

@@ -33,6 +33,8 @@ token 里有 447,657 个（75.6%）根本没有转发给模型。** 配置是
 模型。两个都指向开发这台机器。
 
 ```powershell
+$env:CC_ARCHIVE='1'   
+$env:CC_BATCH='1'; $env:CC_BATCH_N='3'
 python run.py --port 8788 --n-ctx 131072
 curl.exe http://127.0.0.1:8788/health     # {"ok": true}
 ```

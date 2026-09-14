@@ -283,7 +283,8 @@ class Eng:
                    "ddc_tok": 0, "ddc_bypass": 0, "ddc_cutoff": 0,
                    "ddc_gated": 0, "ddc_stood_down": 0, "ddc_feature_s": 0.0,
                    "qhit": 0, "qsaved": 0, "qedit": 0, "qtopk_s": 0.0, "qstore": 0,
-                   "arc_put": 0, "arc_hit": 0, "arc_restore": 0}
+                   "arc_put": 0, "arc_hit": 0, "arc_restore": 0,
+                   "arc_s": 0.0, "arc_tok": 0}
 
         self._turn_mark = self.tok("<|im_start|>user")
         tb = ct.create_string_buffer(1 << 17)
@@ -818,11 +819,18 @@ class Eng:
         the request, and only the single-sequence path uses sequence 0.
         """
         toks, n, clock = self.arc[slot]
+        # Timed because a restore is the one cost this layer adds, and the whole
+        # question of whether a low-reuse hit is worth taking turns on it.  It is
+        # a whole-state seq_cp, so it scales with the state: n x 9216 B.  Measured
+        # so the answer comes from the counter rather than from an estimate.
+        t0 = time.perf_counter()
         self.L.llama_memory_seq_rm(self.kmem, dst, 0, -1)      # clear the target
         self.L.llama_memory_seq_cp(self.kmem, slot, dst, 0, -1)  # restore wholesale
         self.arc[slot] = (toks, n, self.arc_clock)
         self.arc_clock += 1
         self.seq_tokens[dst] = toks.tolist()
+        self.st["arc_s"] = self.st.get("arc_s", 0.0) + time.perf_counter() - t0
+        self.st["arc_tok"] = self.st.get("arc_tok", 0) + n
         if dst == 0:
             self.cur = self.seq_tokens[0]
         self.st["arc_restore"] = self.st.get("arc_restore", 0) + 1
@@ -1436,7 +1444,9 @@ class Eng:
             out += " | " + spec.line()
         if self.arc is not None:
             out += (f" | arc_put={s['arc_put']} arc_hit={s['arc_hit']} "
-                    f"arc_restore={s['arc_restore']} slots={len(self.arc)}")
+                    f"arc_restore={s['arc_restore']} "
+                    f"arc_s={s['arc_s']:.2f}s/{s['arc_tok']}tok "
+                    f"slots={len(self.arc)}")
         if self.qc is not None:
             out += (f" | qhit={s['qhit']} qsaved={s['qsaved']} qedit={s['qedit']} "
                     f"qstore={s['qstore']} qmem={m['qc']:.3f}MB "

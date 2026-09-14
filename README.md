@@ -34,6 +34,8 @@ libraries, `GGUF` your chat model. Both point at the machine this was developed
 on.
 
 ```powershell
+$env:CC_ARCHIVE='1'   
+$env:CC_BATCH='1'; $env:CC_BATCH_N='3'
 python run.py --port 8788 --n-ctx 131072
 curl.exe http://127.0.0.1:8788/health     # {"ok": true}
 ```
