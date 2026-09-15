@@ -404,7 +404,13 @@ class Eng:
         self.ridx: dict = {}                       # (prefix length, digest) -> (trajectory id, position)
         self.rgen: dict = {}                       # trajectory id -> (gen_ids, text, stopk)
         self.ridx_max = 200_000                    # FIFO eviction; a broken chain only loses a recall, it never recalls wrongly
-        self.rcap = 256                            # at most this many positions indexed per trajectory
+        # Kept for reference only.  reg() used to index just the first rcap
+        # positions of a trajectory while rgen held the whole reply, so a recall
+        # starting early in a long reply ran out of index and handed back a
+        # fragment as if it were the finished answer -- a cache hit that ended
+        # the dialog mid-sentence.  Everything generated is indexed now; the
+        # bound that matters is ridx_max.
+        self.rcap = 256
         self.tid = 0
         self.ng = {}; self.ng_done = 0; self.ng_keep = None
         # Fork archives.  Nothing calls snap()/fork() today, and they are NOT
@@ -420,6 +426,12 @@ class Eng:
 
         self.st = {"req": 0, "apc": 0, "lgc": 0, "rcl": 0, "pre": 0, "reuse": 0,
                    "gen": 0, "t_pre": 0.0, "t_gen": 0.0,
+                   # rcl_short counts recalls that were DECLINED because the chain
+                   # broke before the end of the trajectory.  Declining is correct
+                   # (the alternative is a fragment served as a finished reply),
+                   # but it means the layer stopped paying, so it is counted
+                   # rather than silent.
+                   "rcl_short": 0,
                    "ddc_req": 0, "ddc_spec": 0, "ddc_full": 0, "ddc_acc1": 0,
                    "ddc_tok": 0, "ddc_bypass": 0, "ddc_cutoff": 0,
                    "ddc_gated": 0, "ddc_stood_down": 0, "ddc_feature_s": 0.0,
@@ -1253,14 +1265,29 @@ class Eng:
     def reg(self, pids: list[int], toks: list[int], text: str, stopk: tuple):
         """Register every prefix of (prompt + generation) into the index -- any
         later request starting with one of those prefixes then gets the tokens
-        that follow it with no forward pass at all."""
+        that follow it with no forward pass at all.
+
+        Cover the WHOLE reply, not the first ``rcap`` tokens of it.  Indexing
+        only a prefix left the tail of a long reply unreachable, and recall --
+        which reads the continuation straight out of ``rgen`` -- then produced a
+        fragment and reported it as a complete answer, ending the client's turn
+        mid-thought.  ``rgen`` already holds every token, so indexing the whole
+        thing costs one dict entry per generated token, and the FIFO bound
+        ``ridx_max`` is what actually limits resident memory.  ``rcap`` is
+        therefore no longer consulted here.
+
+        Correctness does not depend on how much is indexed: ``walk`` follows the
+        chain position by position and stops the moment it points anywhere other
+        than the next position of this same trajectory, so a partial index only
+        ever loses a recall, never invents one.
+        """
         tid = self.tid
         self.tid += 1
         self.rgen[tid] = (list(toks), text, stopk)
         h = self.hnew(pids)
         n = len(pids)
         self.ridx[(n, h.digest())] = (tid, 0)
-        for k, t in enumerate(toks[:self.rcap]):
+        for k, t in enumerate(toks):
             h.update(self.tbytes(t))
             self.ridx[(n + k + 1, h.digest())] = (tid, k + 1)
         while len(self.ridx) > self.ridx_max:
@@ -1285,7 +1312,32 @@ class Eng:
 
     def recall(self, pids: list[int], max_new: int, stop: list[str]):
         """The prompt lands inside a recorded trajectory -> take the continuation
-        back wholesale (no forward pass, no KV work)."""
+        back wholesale (no forward pass, no KV work).
+
+        Only a continuation that reaches the END of the recorded trajectory is a
+        complete reply, and only a complete reply may be handed back.  The walk
+        can stop early for two different reasons, and they are not the same
+        thing:
+
+        * the caller's own budget, ``max_new``, ran out.  That is a legitimate
+          truncation -- the reply really did run into the token cap, exactly as
+          it would have on the generating path -- so it is served and reported
+          with ``trunc``.
+        * the chain broke before the end of the trajectory.  The index entry the
+          walk needed next is gone (FIFO eviction) or now points at a different
+          trajectory, so what was recovered is a PREFIX of the answer and not the
+          answer.  Serving that is what made a cache hit end a dialog: the client
+          got a mid-sentence fragment, the engine reported no truncation, and the
+          reply looked like a normal ``end_turn``, so nothing ever produced the
+          rest.  This used to be reached every time by a reply longer than
+          ``rcap``, because reg() indexed only its first 256 tokens; reg() now
+          indexes all of them, so the case is genuinely rare -- but it is still
+          the case that must not be answered short.
+
+        Breaking off declines and lets the normal path generate.  That is
+        strictly better than answering short: the cost is one prefill, and the
+        alternative is a silently wrong reply.
+        """
         e = self.ridx.get(self.key(pids))
         if e is None:
             return None
@@ -1294,10 +1346,19 @@ class Eng:
         if gen is None or k >= len(gen) or tuple(stop) != gstop:
             return None          # past the end of the trajectory / different stop set -> hand back to the normal path
         out, k2 = self.walk(tid, k, self.hnew(pids), len(pids), max_new, gen)
+        # Did the walk reach the end of the trajectory, or did the chain break?
+        # Only a walk that arrived at the end recovered the whole reply.
+        if k2 < len(gen) and len(out) < max_new:
+            self.st["rcl_short"] = self.st.get("rcl_short", 0) + 1
+            return None
+        # A walk stopped by max_new is a genuine budget truncation; one stopped
+        # at the end of the trajectory ended on its own.
+        trunc = len(out) >= max_new
         self.st["rcl"] += 1
         self.st["gen"] += len(out)
         txt = gtxt if k2 >= len(gen) else "".join(self.piece(t) for t in out)
-        return out, txt, {"hit": "rcl", "pre": 0, "reuse": len(pids), "n": len(out)}
+        return out, txt, {"hit": "rcl", "pre": 0, "reuse": len(pids),
+                          "n": len(out), "trunc": trunc}
 
     # ---------------- turn-keyed reuse ----------------
     def qreuse(self, pids: list[int], max_new: int, stop: list[str], stopk: tuple,
@@ -1649,6 +1710,7 @@ class Eng:
     def line(self) -> str:
         s, m = self.st, self.mem()
         out = (f"req={s['req']} apc={s['apc']} lgc={s['lgc']} rcl={s['rcl']} "
+               f"rcl_short={s.get('rcl_short', 0)} "
                f"pre={s['pre']} reuse={s['reuse']} gen={s['gen']} "
                f"t_pre={s['t_pre']:.1f}s t_gen={s['t_gen']:.1f}s "
                f"kv={m['kv']:.0f}MB lgt={m['lgc']:.3f}MB/{m['n']}entries "
