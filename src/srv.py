@@ -28,7 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from batch import Batcher, run_job
-from eng import Eng
+from eng import Eng, arc_slot_count, ddc_scratch_count, plan_sequences
 from log import C, log, setup as log_setup
 from qcache import turn_key
 from stream import Streamer
@@ -318,7 +318,9 @@ def sse(h, ev: str, data: dict):
     A client that hangs up mid-stream raises ConnectionResetError on the next
     write, and there is no recovering from it -- but the generation loop keeps
     calling back for every token, so an unguarded write turns one disconnect into
-    a traceback per token.  Latch it instead and go quiet.
+    a traceback per token.  Latch it instead and go quiet -- and mark the
+    connection closed, so keep-alive does not try to read the next request from
+    the dead socket.
     """
     if getattr(h, "_gone", False):
         return False
@@ -328,6 +330,7 @@ def sse(h, ev: str, data: dict):
         return True
     except (ConnectionError, OSError):
         h._gone = True
+        h.close_connection = True
         return False
 
 
@@ -409,13 +412,58 @@ class Api(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def _head(self, code, ctype, extra=()):
+        """Send a status line and headers.  False once the client is gone.
+
+        A client that hangs up between sending its request and reading the reply
+        makes the header flush raise ConnectionResetError.  There is no reply to
+        make to a socket that is already dead, and letting the raise out only
+        reaches do_POST's handler, which has no better move than to write the
+        500 into that same dead socket.  So latch it -- with the same ``_gone``
+        flag sse() uses, so the streaming path and this one agree on what
+        "gone" means -- and let the caller drop the request.
+
+        ``_hdr_sent`` records that a response has started, which is what tells
+        do_POST that a failure is no longer reportable as an error reply.
+        """
+        if getattr(self, "_gone", False):
+            return False
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            for k, v in extra:
+                self.send_header(k, v)
+            self.end_headers()
+            self._hdr_sent = True
+            return True
+        except (ConnectionError, OSError):
+            self._gone = True
+            self.close_connection = True
+            return False
+
+    def _write(self, b):
+        """Write a response body, latched the same way as _head()."""
+        if getattr(self, "_gone", False):
+            return False
+        try:
+            self.wfile.write(b)
+            # Flushed here rather than left to the buffered writer: a body that
+            # fits in the buffer would otherwise not touch the socket until
+            # handle_one_request flushes it, so the disconnect would surface
+            # outside this guard instead of setting _gone.
+            self.wfile.flush()
+            return True
+        except (ConnectionError, OSError):
+            self._gone = True
+            self.close_connection = True
+            return False
+
     def _send(self, code, obj):
         b = json.dumps(obj, ensure_ascii=False).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(b)))
-        self.end_headers()
-        self.wfile.write(b)
+        if not self._head(code, "application/json",
+                          [("Content-Length", str(len(b)))]):
+            return False
+        return self._write(b)
 
     def do_GET(self):
         if self.path.startswith("/health"):
@@ -445,17 +493,29 @@ class Api(BaseHTTPRequestHandler):
             return self._send(404, {"error": "not found"})
         try:
             self.msg(req)
+        except (ConnectionError, TimeoutError) as ex:
+            # The client hung up, or its socket timed out, between sending the
+            # request and reading the reply -- CC reconnecting after its own
+            # timeout looks exactly like this, and it is routine.  Nobody is
+            # left to answer, so latch the connection closed and note it in one
+            # line instead of dumping a traceback for an ordinary disconnect.
+            self._gone = True
+            self.close_connection = True
+            logit(f"client gone before reply ({type(ex).__name__})", "warn")
         except Exception as ex:
             import traceback
             traceback.print_exc()
-            try:
+            # An error reply can only replace the real one if the real one has
+            # not started: once the headers are out (and in streaming mode,
+            # message_start with them) the client is parsing a response body,
+            # and a second status line written into it is protocol corruption
+            # rather than an error report.
+            if not getattr(self, "_hdr_sent", False):
                 self._send(500, {"type": "error", "error":
                                  {"type": "api_error", "message": str(ex)}})
-            except Exception:
-                pass
 
     def msg(self, req):
-        mdl = req.get("model", "qwythos-9b")
+        mdl = req.get("model", "Your_Model")
         mx = int(req.get("max_tokens") or 512)
         stream = bool(req.get("stream"))
         # Whether this reply's reasoning goes to the client.  CC_THINK turns it
@@ -610,11 +670,10 @@ class Api(BaseHTTPRequestHandler):
                                                    info.get("reuse") or 0)})
 
         # ---- streaming ----
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.end_headers()
+        if not self._head(200, "text/event-stream",
+                          [("Cache-Control", "no-cache"),
+                           ("Connection", "keep-alive")]):
+            return          # already gone: nothing to stream to, and no reply to make
         # message_start is NOT sent here.  Its usage is what Claude Code writes
         # into the session transcript, and the cache fields in it can only be
         # right if the serving layer is already known -- which it is not yet:
@@ -844,27 +903,32 @@ def main():
     ap.add_argument("--n-ctx", type=int, default=131072)
     a = ap.parse_args()
     global BATCHER
-    nseq, n_ctx = 1, a.n_ctx
     workers = 1
     if os.environ.get("CC_BATCH") == "1":
         workers = max(2, int(os.environ.get("CC_BATCH_N", "4")))
-    # The archive keeps its own sequences, and the scheduler gets the rest.  They
-    # are sized together because they share the context: sizing them separately
-    # is how the archive ends up handing work to a sequence it is using.
-    arc_slots = (int(os.environ.get("CC_ARCHIVE_SLOTS", "1"))
-                 if os.environ.get("CC_ARCHIVE") == "1" else 0)
-    nseq = workers + arc_slots
+    # The whole sequence budget -- workers, DDC's verification scratch, archive
+    # slots -- comes from eng.plan_sequences, which owns the layout and is the
+    # same function Eng reads its indices off.  Sized in one place on purpose:
+    # when srv.py sized the archive and Eng sized DDC's doubling separately, the
+    # two agreed only by accident, and DDC's scratch landed on a sequence the
+    # archive had already claimed.
+    nseq, n_ctx, ddc_seq = plan_sequences(a.n_ctx, workers)
     if nseq > 1:
-        # The KV cells are n_ctx in total and are split across sequences, so
-        # n_ctx is multiplied to keep every sequence's window -- which is what
-        # makes this cost memory rather than nothing.
-        n_ctx = a.n_ctx * nseq
-        logit(f"{workers} worker sequence(s) + {arc_slots} archive slot(s), "
+        # n_ctx is multiplied so every sequence keeps the full window: the cells
+        # are n_ctx in total and llama.cpp divides them across the sequences,
+        # which is what makes this cost memory rather than nothing.  Every term
+        # is read off the plan rather than assumed -- this line is how the
+        # layout gets checked at startup, so a hardcoded count here would be a
+        # wrong answer to the question it exists to answer.
+        scratch_n = ddc_scratch_count(workers)
+        logit(f"nseq {nseq} = {workers} worker(s) + "
+              f"{f'{scratch_n} DDC scratch + ' if scratch_n else ''}"
+              f"{arc_slot_count()} archive slot(s), "
               f"n_ctx {a.n_ctx} -> {n_ctx} (KV reservation x{nseq})")
     log_setup(LOGDIR)
     log_setup(LOGDIR)
-    logit(f"loading engine n_ctx={n_ctx}")
-    E = Eng(n_ctx=n_ctx, nseq=nseq, log=logit)
+    logit(f"loading engine n_ctx={n_ctx} nseq={nseq}")
+    E = Eng(n_ctx=n_ctx, nseq=nseq, workers=workers, log=logit)
     if workers > 1:
         BATCHER = Batcher(E, log=logit)
         logit(f"scheduler up: {len(E.work_seqs)} worker sequences "

@@ -9,7 +9,7 @@ line doesn't work, pass an override config via --settings):
 
     ANTHROPIC_BASE_URL = http://127.0.0.1:8788
     ANTHROPIC_AUTH_TOKEN = local
-    ANTHROPIC_MODEL = qwythos-9b
+    ANTHROPIC_MODEL = Your_Model
 
 Debug switches:
     CC_LOGDIR=<dir> where the request log and server log go (default ./logs)
@@ -60,7 +60,7 @@ Batched serving (experimental, off by default; see USAGE.md section 6.5):
                     numerics, not a race).
     CC_BATCH_N=4    sequences, i.e. how many requests can be in flight at once
 
-Prefix archive (experimental, off by default; see USAGE.md section 6.4):
+Prefix archive (on by default; CC_ARCHIVE=0 turns it off.  See USAGE.md 6.4):
     CC_ARCHIVE=1    keep whole KV states at the points where requests have
                     actually diverged, in spare sequences, and restore one
                     wholesale when a later request asks for it.  This is what
@@ -69,7 +69,8 @@ Prefix archive (experimental, off by default; see USAGE.md section 6.4):
                     it every sibling rebuilds its whole context.  Measured at 65x
                     less prefill on siblings, with an identical reply.  It needs
                     a spare sequence, so n_ctx doubles (KV 1.2 GB -> 2.4 GB at
-                    131072) -- that is the cost, and it is why this is opt-in.
+                    131072) -- that is the cost.
+    CC_ARCHIVE=0    turn it off, back to a plain single-sequence server
     CC_ARCHIVE_MIN=512  shortest prefix worth archiving
 
 Speculation gate (see spec.py): a speculative round costs a verification pass
@@ -108,17 +109,22 @@ token, and it keeps running while DDC is stood down.
     The ~13% diverse penalty becomes ~3% (the grace window is the rest), and the
     repetitive win survives at 2.0x.
 
-DDC draft cache (on by default; data in DDC_EXPERIMENT.md):
-    CC_DDC=0        turn it off
-    CC_DDC=2|4      on, with that n-gram key width (default 4)
+DDC draft cache (off by default; data in DDC_EXPERIMENT.md):
+    CC_DDC=0        off (the default)
+    CC_DDC=2|4      on, with that n-gram key width (4 recommended)
                     Look up a historical trajectory by ranking fingerprint to
-                    produce a draft, batch-verify it against the target model;
-                    automatically raises nseq>=2. ~1.5x on repeated code edits in
-                    a small context, switches to per-token once the context
-                    threshold is reached, no promise that short segments match the
-                    default path bit for bit.  It yields to CC_ARCHIVE=1, which
-                    needs the same spare sequences; setting both by name is
-                    refused.
+                    produce a draft, batch-verify it against the target model.
+                    ~1.5x on repeated code edits in a small context, switches to
+                    per-token once the context threshold is reached, no promise
+                    that short segments match the default path bit for bit.  It
+                    takes a spare sequence of its own, which raises nseq.  It
+                    runs alongside the archive (on by default) rather than
+                    standing it down: the archive's slots and DDC's verification
+                    scratch are disjoint (see eng.plan_sequences), at the cost
+                    of one sequence each.  Under CC_BATCH it only runs if
+                    CC_DDC_BATCH=1 asks the scheduler for it (new, unrun);
+                    otherwise the scheduler serves every request and no
+                    speculation happens.
     CC_DDC_M=32     max draft length (the cap; T is what usually binds)
     CC_DDC_T=0.5    margin truncation threshold -- LOWER means LONGER drafts
                     (0 = fixed-length drafts).  The round's rate rises

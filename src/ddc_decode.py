@@ -24,15 +24,25 @@ def token_bytes(e, token):
 
 
 def generate(e, prompt, max_new, cache=None, stop=("<|im_end|>",), prepared_logits=None,
-             max_context=0):
+             max_context=0, reuse=None):
     """Return tokens, UTF-8 text, and synchronized wall-time/call counters.
 
-    A cache contains only committed past tokens. Sequence 1 is scratch space;
-    whole-state copies are used because hybrid recurrence cannot be truncated.
-    Timing includes lookups, feature extraction, copies, refeeding and decoding.
-    max_context disables DDC at that many committed prompt+output tokens (0
-    means unlimited). Drafts cannot cross the boundary. The caller's cache is
-    retained for subsequent short requests; long requests do not update it.
+    A cache contains only committed past tokens. Verification runs on a scratch
+    sequence of the engine's choosing (``e.ddc_seq``), with the committed state
+    held on sequence 0; whole-state copies are used because hybrid recurrence
+    cannot be truncated. Timing includes lookups, feature extraction, copies,
+    refeeding and decoding. max_context disables DDC at that many committed
+    prompt+output tokens (0 means unlimited). Drafts cannot cross the boundary.
+    The caller's cache is retained for subsequent short requests; long requests
+    do not update it.
+
+    ``reuse`` is how many prompt tokens the KV already holds when the caller
+    established the prefix itself -- which is what the engine's serving path
+    does, so that the prefix archive can take part in the prefill (see
+    Eng.plan_prefix/feed_prefix). With it, this function forwards nothing and
+    only reads the logits the caller's prefill left; without it, it prefills by
+    plain APC. ``prepared_logits`` remains the benchmark-only shortcut, where the
+    caller restored a state identical to the whole prompt.
     """
     if max_context < 0:
         raise ValueError("max_context must be nonnegative")
@@ -42,6 +52,18 @@ def generate(e, prompt, max_new, cache=None, stop=("<|im_end|>",), prepared_logi
         disabled_at = len(prompt)
     if cache is not None and e.nseq < 2:
         raise ValueError("DDC verification requires nseq >= 2")
+    # Which sequence holds the verification copy.  This used to be the literal 1
+    # everywhere below, which was only ever correct because the serial layout
+    # happened to put the scratch there; the archive now sits above it and the
+    # engine owns the index (eng.plan_sequences).  A stand-in object without the
+    # attribute keeps the old behaviour; a real engine that reserved no scratch
+    # has none to offer and is told so rather than corrupting a worker sequence.
+    scratch = getattr(e, "ddc_seq", 1)
+    if cache is not None:
+        if scratch is None:
+            raise ValueError("DDC needs a scratch sequence; the engine reserved none")
+        if scratch == 0:
+            raise ValueError("DDC scratch sequence cannot be sequence 0")
     if max_new < 0 or not prompt:
         raise ValueError("Need a nonempty prompt and nonnegative token budget")
     # The repetition detector's grace window is per generation, so it restarts
@@ -57,7 +79,21 @@ def generate(e, prompt, max_new, cache=None, stop=("<|im_end|>",), prepared_logi
                  generation_seconds=0., reused=0, stop=None,
                  cache_tokens_discarded=0, cache_tokens_at_start=0,
                  ddc_max_context=max_context, ddc_disabled_at=disabled_at)
-    if prepared_logits is None:
+    if prepared_logits is not None:
+        # Benchmark-only: caller restored an identical whole-state snapshot.
+        if e.cur != prompt or e.kvlen() != len(prompt):
+            raise ValueError("Prepared logits require the matching restored prefix")
+        live = prepared_logits
+        stats["reused"] = len(prompt)
+    elif reuse is not None:
+        # The caller established the prefix -- through the archive, when one is
+        # on -- and forwarded the rest, so there is no prefill left to do here.
+        # Reading the logits is all that remains, and it is what synchronizes
+        # the pending forward pass, so it belongs in the prefill timing.
+        started = time.perf_counter()
+        live = np.ctypeslib.as_array(lib.llama_get_logits_ith(e.ctx, -1), shape=(e.nv,))
+        stats.update(prefill_seconds=time.perf_counter()-started, reused=reuse)
+    else:
         started = time.perf_counter()
         p = e.lcp(prompt)
         if p < len(e.cur) and not e.trunc(p):
@@ -68,12 +104,6 @@ def generate(e, prompt, max_new, cache=None, stop=("<|im_end|>",), prepared_logi
         # The getter synchronizes pending work before timing prefill ends.
         live = np.ctypeslib.as_array(lib.llama_get_logits_ith(e.ctx, -1), shape=(e.nv,))
         stats.update(prefill_seconds=time.perf_counter()-started, reused=p)
-    else:
-        # Benchmark-only: caller restored an identical whole-state snapshot.
-        if e.cur != prompt or e.kvlen() != len(prompt):
-            raise ValueError("Prepared logits require the matching restored prefix")
-        live = prepared_logits
-        stats["reused"] = len(prompt)
     tokens, raw = [], bytearray()
     markers = [(x, x.encode("utf-8")) for x in stop if x]
     stopped = None
@@ -155,12 +185,12 @@ def generate(e, prompt, max_new, cache=None, stop=("<|im_end|>",), prepared_logi
         else:
             draft = list(proposal.tokens)
             t_copy = time.perf_counter()
-            lib.llama_memory_seq_rm(mem, 1, 0, -1)
-            lib.llama_memory_seq_cp(mem, 0, 1, 0, -1)
+            lib.llama_memory_seq_rm(mem, scratch, 0, -1)
+            lib.llama_memory_seq_cp(mem, 0, scratch, 0, -1)
             stats["copy_seconds"] += time.perf_counter() - t_copy
             try:
                 t_batch = time.perf_counter()
-                decode_many(draft, 1, pos)
+                decode_many(draft, scratch, pos)
                 stats["batch_seconds"] += time.perf_counter() - t_batch
                 t_scan = time.perf_counter()
                 count = 1
@@ -169,7 +199,7 @@ def generate(e, prompt, max_new, cache=None, stop=("<|im_end|>",), prepared_logi
                 stats["verify_scan_seconds"] += time.perf_counter() - t_scan
                 accepted = draft[:count]
             except BaseException:
-                lib.llama_memory_seq_rm(mem, 1, 0, -1)
+                lib.llama_memory_seq_rm(mem, scratch, 0, -1)
                 raise
 
         # Apply stopping before committing state or indexing a speculative tail.
@@ -207,12 +237,12 @@ def generate(e, prompt, max_new, cache=None, stop=("<|im_end|>",), prepared_logi
                 # This is the whole-state copy the long-context case pays for.
                 t_swap = time.perf_counter()
                 lib.llama_memory_seq_rm(mem, 0, 0, -1)
-                lib.llama_memory_seq_cp(mem, 1, 0, 0, -1)
-                lib.llama_memory_seq_rm(mem, 1, 0, -1)
+                lib.llama_memory_seq_cp(mem, scratch, 0, 0, -1)
+                lib.llama_memory_seq_rm(mem, scratch, 0, -1)
                 stats["copy_seconds"] += time.perf_counter() - t_swap
             else:
                 t_rm = time.perf_counter()
-                lib.llama_memory_seq_rm(mem, 1, 0, -1)
+                lib.llama_memory_seq_rm(mem, scratch, 0, -1)
                 stats["copy_seconds"] += time.perf_counter() - t_rm
                 t_re = time.perf_counter()
                 decode_many(accepted, 0, pos)
@@ -223,7 +253,7 @@ def generate(e, prompt, max_new, cache=None, stop=("<|im_end|>",), prepared_logi
             # overwrite the shared logits buffer. No rejected tail is indexed.
             descriptions = [first] + [describe(row(i)) for i in range(count-1)]
             live = row(count-1)
-            if lib.llama_memory_seq_pos_max(mem, 1) != -1:
+            if lib.llama_memory_seq_pos_max(mem, scratch) != -1:
                 raise RuntimeError("Scratch sequence was not cleared")
 
         round_seconds = time.perf_counter() - round_started - overhead

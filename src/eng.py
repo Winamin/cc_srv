@@ -34,6 +34,92 @@ import spec
 from lib import Mp, Cp, Msg, Batch, GGUF, Q4_0, bind
 
 
+def ddc_key():
+    """The CC_DDC setting in force, or None when the draft cache is off.
+
+    Off by default.  It was on by default until the archive became the default
+    instead: the archive is the layer that helps the shape this server actually
+    sees (agent fan-out), while a draft cache is a throughput knob that pays
+    only where the content repeats and changes the numerical path when it does.
+    See the draft-cache block in Eng.__init__.
+
+    This stays the place the default is decided, so that eng.plan_sequences and
+    Eng.__init__ cannot disagree about whether DDC is on -- they both call it.
+    """
+    v = os.environ.get("CC_DDC")
+    return v if (v and v != "0") else None
+
+
+def arc_slot_count() -> int:
+    """How many sequences the prefix archive asks to keep.  0 when it is off.
+
+    On by default; ``CC_ARCHIVE=0`` turns it off.
+    """
+    v = os.environ.get("CC_ARCHIVE", "1").strip().lower()
+    if v in ("0", "false", "off", "no"):
+        return 0
+    return int(os.environ.get("CC_ARCHIVE_SLOTS", "1"))
+
+
+def ddc_batch_pool() -> int:
+    """Scratch sequences for DDC inside the batched scheduler.
+
+    0 (off) unless CC_DDC_BATCH=1.  Unverified -- see Batcher's speculation
+    block -- so it stays opt-in rather than riding on CC_DDC's default.
+    """
+    if os.environ.get("CC_DDC_BATCH") != "1":
+        return 0
+    return max(0, int(os.environ.get("CC_DDC_BATCH_SCRATCH", "1")))
+
+
+def ddc_scratch_count(workers: int) -> int:
+    """How many sequences DDC needs of its own.
+
+    One, on the serial path.  Under CC_BATCH it is a small pool instead: the
+    scheduler serves several requests at once, and a verification needs its
+    scratch for the whole round, so a single one would let only one of them
+    speculate.  The pool is a bound on the KV reservation, not on correctness --
+    a job that cannot get a scratch decodes normally.
+    """
+    if ddc_key() is None:
+        return 0
+    if workers == 1:
+        return 1
+    return ddc_batch_pool()
+
+
+def plan_sequences(n_ctx: int, workers: int) -> tuple[int, int, int | None]:
+    """Decide the sequence budget, and with it the KV reservation.
+
+    Returns ``(nseq, n_ctx, ddc_seq)``: the sequence count, the cells to reserve,
+    and the first index DDC's verification scratch lives on (None when none is
+    reserved).
+
+    One layout rule, in index order::
+
+        0 .. workers-1                 work sequences
+        workers .. workers+scratch-1   DDC's verification scratch (or pool)
+        the last CC_ARCHIVE_SLOTS      archived whole states
+
+    The scratch is reserved only when DDC can actually run: on the serial path,
+    or under CC_BATCH when CC_DDC_BATCH turns the speculative scheduler on.
+
+    srv.py calls this before the context exists and Eng calls it again while
+    constructing; its outputs are pure functions of (workers, environment) -- the
+    n_ctx argument only scales the returned reservation -- so the two calls
+    cannot drift.  They used to be sized separately -- srv.py owned the archive,
+    Eng owned DDC's doubling -- which is exactly how DDC's scratch ended up on
+    the sequence the archive had already claimed.
+
+    n_ctx is multiplied so that every sequence keeps the caller's full window:
+    llama.cpp divides its cells across n_seq_max, so this is the whole reason the
+    combination costs memory rather than nothing.
+    """
+    nseq = max(1, workers + ddc_scratch_count(workers) + arc_slot_count())
+    ddc_seq = workers if ddc_scratch_count(workers) else None
+    return nseq, (n_ctx * nseq if nseq > 1 else n_ctx), ddc_seq
+
+
 def probe(e, pids: list[int], max_new: int, stop: list[str], stopk: tuple,
           turn=None, on_token=None, on_serve=None):
     """Try every layer that needs no KV work.  Returns gen()'s triple, or None.
@@ -115,9 +201,30 @@ def probe(e, pids: list[int], max_new: int, stop: list[str], stopk: tuple,
 
 class Eng:
     def __init__(self, n_ctx: int = 131072, bs: int = 512, n_rs: int = 0,
-                 nseq: int = 1, log=print):
+                 nseq: int = 1, workers: int = 1, log=print):
         self.log = log
         L = self.L = bind()
+
+        # The sequence layout is settled once, here, from the caller's numbers
+        # and the environment; every index below is read off it instead of being
+        # re-derived.  srv.py has already applied the same plan, so nseq normally
+        # arrives at the planned value and nothing below moves.
+        plan_nseq, _, self.ddc_seq = plan_sequences(n_ctx, workers)
+        if nseq < plan_nseq:
+            # A direct caller (this module's own smoke test, a benchmark harness)
+            # asked for fewer sequences than the configuration needs.  The window
+            # it asked for is n_ctx // nseq, and every sequence keeps it: that
+            # reservation is the price of the layout, and paying it beats the old
+            # behaviour of quietly halving every sequence's window instead.
+            n_ctx = max(1, n_ctx // max(1, nseq)) * plan_nseq
+            nseq = plan_nseq
+        # The sequences DDC may verify on.  On the serial path this is the single
+        # scratch ddc_decode copies into (and ddc_seq is its index); under
+        # CC_DDC_BATCH the scheduler claims one per speculative round from the
+        # same list, so the two paths can never disagree about which sequences
+        # are DDC's.
+        self.ddc_pool: list = list(range(workers,
+                                          workers + ddc_scratch_count(workers)))
 
         # DDC draft cache (experimental, off by default; data in DDC_EXPERIMENT.md).
         # Key = top-k token ranking of the current logits -- what is read out is
@@ -133,25 +240,27 @@ class Eng:
         # nseq.
         self.ddc = None
         self.ddc_max_ctx = 0          # set below, once the window is known
-        # On by default.  This is the draft cache that makes a long agentic turn
-        # cheap, and what keeps it honest is the per-round gate in spec.py: it
-        # drops any draft length that stops paying, and stands the whole thing
-        # down on content that is not repeating.
+        # Off by default.  Turned on it is the draft cache that makes a long
+        # agentic turn cheap, and what keeps it honest is the per-round gate in
+        # spec.py: it drops any draft length that stops paying, and stands the
+        # whole thing down on content that is not repeating.
+        #   unset       off
         #   CC_DDC=0    off
         #   CC_DDC=2|4  on, with that n-gram key width
         #
-        # k=4 is the default because that is the configuration the draft lengths
-        # were measured in: k4 + M=32 + T=0.5 gave 15-22 tokens per round against
-        # 6-13 for the older k2/M=16/T=1.0.  k=2 was what the live CC session had
-        # been run with, and the two were never separated in a clean sweep.
+        # k=4 is the recommended width because that is the configuration the
+        # draft lengths were measured in: k4 + M=32 + T=0.5 gave 15-22 tokens per
+        # round against 6-13 for the older k2/M=16/T=1.0.  k=2 was what the live
+        # CC session had been run with, and the two were never separated in a
+        # clean sweep.
         #
-        # The prefix archive keeps its states in the same spare sequences, so the
-        # two are mutually exclusive.  An archive asked for by name wins this
-        # default; asking for both by name is still refused outright, below.
-        _ddc_env = os.environ.get("CC_DDC")
-        _k = (_ddc_env if _ddc_env is not None
-              else (None if os.environ.get("CC_ARCHIVE") == "1" else "4"))
-        if _k and _k != "0":
+        # The prefix archive used to keep its states in the same spare
+        # sequences, and the pair was refused rather than letting the two
+        # silently overwrite each other.  They no longer overlap: DDC's
+        # verification scratch gets a sequence of its own and the archive sits
+        # above it (see plan_sequences), so naming both serves both.
+        _k = ddc_key()
+        if _k is not None:
             from ddc import DraftCache
             _k = int(_k)
             if _k not in (2, 4):
@@ -167,13 +276,15 @@ class Eng:
                                   threshold=float(os.environ.get("CC_DDC_T", "0.5")),
                                   gate=float(os.environ.get("CC_DDC_GATE", "0.")),
                                   reset_per_request=os.environ.get("CC_DDC_RESET") == "1")
-            if nseq < 2:
-                nseq = 2
-                # The KV cells are n_ctx in total and are split across sequences
-                # (measured: 32768 with nseq2 dies at 16384).  Doubling n_ctx
-                # keeps the main sequence's full window; the price is 2x KV
-                # reservation (2.4 GB at 131072).
-                n_ctx *= 2
+            if self.ddc_seq is None:
+                # DDC is on but no scratch sequence was reserved, which under
+                # this layout means a batcher is serving every request.  Saying
+                # so once is worth more than the silence: the DDC counters and
+                # the spec.py governor would otherwise just never move.
+                log("CC_DDC is on but the batched scheduler serves every request "
+                    "and DDC runs on the serial path only -- no scratch sequence "
+                    "reserved, so no speculation will happen (unset CC_BATCH to "
+                    "use DDC)")
             # Default the cutoff to this sequence's own window, so it never
             # stands DDC down early; it remains only as the clamp that stops a
             # draft running past the end of the context.
@@ -194,7 +305,8 @@ class Eng:
                 f"T={os.environ.get('CC_DDC_T', '0.5')} gate={self.ddc.gate} "
                 f"reset_per_request={self.ddc.reset_per_request} "
                 f"max_context={self.ddc_max_ctx} "
-                f"(nseq>=2, n_ctx doubled to {n_ctx})")
+                f"(scratch={self.ddc_seq if self.ddc_seq is not None else 'none'}, "
+                f"nseq={nseq}, n_ctx={n_ctx})")
 
         # Turn-keyed reuse (experimental, off by default; see qcache.py and
         # USAGE.md).  Unlike the exact-prompt cache this one fires when the same
@@ -214,7 +326,8 @@ class Eng:
             log(f"turn-keyed reuse on level={_q} edit={self.qc.edit} "
                 f"topk={self.qc.topk} sim={self.qc.sim} skip_tool={self.qc.skip_tool}")
 
-        # Prefix archive (experimental, off by default; see USAGE.md 6.4).
+        # Prefix archive (on by default; CC_ARCHIVE=0 turns it off.  See USAGE.md
+        # 6.4).
         # The engine keeps one KV, and a request that is shorter than it -- or
         # that diverges before its end -- needs a truncation, which this hybrid
         # memory cannot do.  That is what drops prefix capture from ~0.85 in a
@@ -228,33 +341,31 @@ class Eng:
         self.arc = None
         self.arc_slots: list = []
         self.arc_min = int(os.environ.get("CC_ARCHIVE_MIN", "512"))
-        # Which sequences a batched scheduler may use for work.  Declared here,
-        # before the archive block, so the archive can narrow it; a later
-        # re-assignment would silently undo the partition and let the scheduler
-        # hand work to a sequence the archive is using.
-        self.work_seqs: list = list(range(nseq))
-        if os.environ.get("CC_ARCHIVE") == "1":
-            if self.ddc is not None:
-                # DDC verifies drafts on sequence 1 and clears it every round; the
-                # archive keeps states in the same spare sequences.  Rather than
-                # let them silently corrupt each other's states, refuse the pair.
-                # Unreachable when CC_DDC is left at its default: the default
-                # stands down under CC_ARCHIVE=1, so reaching here means both
-                # were asked for by name.
-                raise RuntimeError(
-                    "CC_ARCHIVE and CC_DDC both need the spare sequences; "
-                    "enable one (DDC defaults off when CC_ARCHIVE=1)")
-            want = int(os.environ.get("CC_ARCHIVE_SLOTS", "1"))
-            if nseq < want + 1:
-                nseq = want + 1
-                n_ctx *= 2      # the KV cells are n_ctx total and split across sequences
+        # Which sequences a batched scheduler may use for work: the first
+        # ``workers`` of them and no others.  Derived here rather than left as
+        # range(nseq), because under the current layout nseq counts the archive
+        # slots and DDC's scratch as well, and handing a scheduler one of those
+        # would overwrite an archived state or DDC's verification copy mid-round.
+        self.work_seqs: list = list(range(workers))
+        want = arc_slot_count()
+        if want:
             self.arc = {}
             self.arc_clock = 1
+            # The top of the range, above the workers and above DDC's scratch.
+            # That is what makes the arithmetic safe: the layout reserves the
+            # scratch BELOW the archive, so "nseq - want" can only ever land on
+            # an archive slot.  Reading it off the layout instead of recomputing
+            # workers+scratch here is deliberate -- recomputing is how the index
+            # that used to be DDC's scratch came to be handed out as an archive
+            # slot, which is the overlap this pairing was refused for.
             self.arc_slots = list(range(nseq - want, nseq))
-            self.work_seqs = list(range(0, nseq - want))
             log(f"prefix archive on, slots {self.arc_slots}, "
                 f"worker sequences {self.work_seqs}, "
                 f"min prefix {self.arc_min} tokens (nseq={nseq}, n_ctx={n_ctx})")
+        if self.ddc is not None and self.ddc_seq is not None:
+            log(f"DDC verification scratch {self.ddc_pool}, "
+                f"archive slots {self.arc_slots or 'none'} "
+                f"(disjoint; nseq={nseq})")
 
         # The KV cells are n_ctx in total and llama.cpp divides them across
         # n_seq_max sequences, so this is how many tokens ONE sequence can hold.
@@ -296,7 +407,11 @@ class Eng:
         self.rcap = 256                            # at most this many positions indexed per trajectory
         self.tid = 0
         self.ng = {}; self.ng_done = 0; self.ng_keep = None
-        self.nseq = nseq; self.snaps = {}; self.slot = 1   # fork archives
+        # Fork archives.  Nothing calls snap()/fork() today, and they are NOT
+        # layout-aware: they cycle 1..nseq-1, which now includes DDC's scratch
+        # and the archive slots.  Whoever wires them up has to start the cycle
+        # above plan_sequences' reservations first.
+        self.nseq = nseq; self.snaps = {}; self.slot = 1
         self.seq = []; self.ng_k = 6                        # used by prompt lookup
         # What each sequence's KV holds, as far as the scheduler's ledger knows.
         # Only the batched path uses this; the single-sequence path keeps the
@@ -490,22 +605,24 @@ class Eng:
     def batch_parts(self, parts):
         """One batch built from tokens belonging to several sequences.
 
-        ``parts`` is ``[(seq_id, pos0, tokens), ...]``.  Every sequence keeps its
-        own position, so the batch can carry a prefill chunk of one request next
-        to a single decode step of another.
+        ``parts`` is ``[(seq_id, pos0, tokens[, all_rows]), ...]``.  Every
+        sequence keeps its own position, so the batch can carry a prefill chunk
+        of one request next to a single decode step of another.
 
-        Logits are requested only for the LAST token of each part.  A caller
-        needs one row per sequence -- the next-token distribution -- and asking
-        for every position would cost a vocabulary-sized row per token for
-        nothing.
+        Logits are requested only for the LAST token of each part, unless the
+        part sets ``all_rows``.  A caller needs one row per sequence -- the
+        next-token distribution -- and asking for every position would cost a
+        vocabulary-sized row per token for nothing.  Speculative verification is
+        the exception and the reason the flag exists.
 
-        Returns ``(batch, keep, idx)`` where ``idx[k]`` is the BATCH POSITION of
-        part k's last token.  llama_get_logits_ith is indexed by batch position
-        and answers only for a position whose batch.logits flag is set -- passing
-        the part number instead is wrong the moment the parts have different
-        lengths, and it fails loudly ("invalid logits id") rather than subtly.
+        Returns ``(batch, keep, idx, first)`` where ``idx[k]`` and ``first[k]``
+        are the BATCH POSITIONS of part k's last and first tokens.
+        llama_get_logits_ith is indexed by batch position and answers only for a
+        position whose batch.logits flag is set -- passing the part number
+        instead is wrong the moment the parts have different lengths, and it
+        fails loudly ("invalid logits id") rather than subtly.
         """
-        total = sum(len(t) for _, _, t in parts)
+        total = sum(len(p[2]) for p in parts)
         if total == 0:
             raise ValueError("empty batch")
         tk = (ct.c_int32 * total)()
@@ -515,26 +632,38 @@ class Eng:
         sid = (ct.POINTER(ct.c_int32) * total)()
         holds = []
         idx = []
+        first = []
         i = 0
-        for seq, pos0, toks in parts:
+        for part in parts:
+            seq, pos0, toks = part[0], part[1], part[2]
+            all_rows = len(part) > 3 and part[3]
             if not toks:
                 continue
             hold = (ct.c_int32 * 1)(seq)
             holds.append(hold)
             ptr = ct.cast(hold, ct.POINTER(ct.c_int32))
             last = len(toks) - 1
+            first.append(i)
             for j, t in enumerate(toks):
                 tk[i] = t
                 ps[i] = pos0 + j
                 ns[i] = 1
                 sid[i] = ptr
-                lg[i] = 1 if j == last else 0
+                # Speculative verification is the one caller that wants every
+                # position: it compares the model's own prediction at position j
+                # against the draft's token j+1, so a row per draft token is the
+                # whole point.  A plain part wants only the next-token
+                # distribution, and asking for the rest would be a
+                # vocabulary-sized row per token for nothing.
+                lg[i] = 1 if (all_rows or j == last) else 0
                 i += 1
             idx.append(i - 1)
         b = Batch()
         b.n_tokens = total; b.token = tk; b.embd = None; b.pos = ps
         b.n_seq_id = ns; b.seq_id = sid; b.logits = lg
-        return b, (tk, ps, ns, sid, lg, holds), idx
+        # ``first`` is the batch position of part k's FIRST token, which is what
+        # a verification scan walks forward from; ``idx`` stays the last one.
+        return b, (tk, ps, ns, sid, lg, holds), idx, first
 
     def logits_row(self, i: int):
         """Logits at BATCH POSITION ``i`` (see batch_parts), as a numpy view."""
@@ -1212,6 +1341,64 @@ class Eng:
                                          "edit_rejected")})
         return toks, text, out
 
+    # ---------------- prefill, shared by the plain and DDC serving paths ----------------
+    # These two are the APC/archive half of gen(), lifted out so that gen_ddc()
+    # can run the same prefill.  The pair has to stay in step with itself: which
+    # prefix is used (plan_prefix) decides what feed_prefix may skip, and the
+    # archive put in feed_prefix depends on the divergence point plan_prefix
+    # reported.  It also has to be the SAME code in both serving paths, because
+    # the archive is only ever populated on the way past a divergence point --
+    # with DDC on, a prefill that skipped the put would leave the archive
+    # permanently empty and every restore a miss.
+    def plan_prefix(self, pids: list[int], arc) -> tuple[int, int]:
+        """Decide how much of ``pids`` the KV can hold.  -> (p, p_raw).
+
+        ``p`` is the position the KV is left at, ``p_raw`` the common prefix
+        before any truncation.  No forward pass happens here, which is what lets
+        the caller report on_serve before the prefill rather than after it.
+        """
+        p_raw = self.lcp(pids)
+        p = p_raw
+        if p < len(self.cur):
+            # Anything short of the KV's end needs a truncation, and a partial
+            # truncation is a no-op on this hybrid memory -- so on its own this
+            # is a full rebuild.  An archived state, if one holds a prefix of
+            # this prompt, is restored whole instead, and seq_cp does do that.
+            hit = self.arc_find(pids) if arc is not None else None
+            if hit is not None and hit[1] < len(pids):
+                # arc_restore returns the tokens it restored, because the batched
+                # scheduler needs them for its ledger; what this path wants is how
+                # many there are, since p is a position.
+                #
+                # The hit has to leave something to forward.  A state exactly as
+                # long as the prompt would mean no forward pass at all, and both a
+                # restore and a truncation leave the logits buffer holding
+                # whatever the LAST decode produced -- some previous request's
+                # token, not this prompt's next one.  Those hits are dropped and
+                # the prompt rebuilt, which is the only case that pays full price.
+                p = len(self.arc_restore(hit[0]))
+                self.st["arc_hit"] = self.st.get("arc_hit", 0) + 1
+            elif p == len(pids) or not self.trunc(p):
+                p = 0
+        return p, p_raw
+
+    def feed_prefix(self, pids: list[int], p: int, p_raw: int, arc) -> None:
+        """Forward ``pids[p:]``, archiving the divergence point on the way past.
+
+        The boundary at ``p_raw`` -- the last position this prompt shares with
+        whatever was in the KV -- is where a sibling branch diverges too, so it is
+        the state a fan-out will ask for next, and this is the only moment it
+        exists.
+        """
+        if p >= len(pids):
+            return
+        if arc is not None and self.arc_ready(p_raw) and p < p_raw <= len(pids):
+            self.feed(pids[p:p_raw])
+            self.arc_put(pids[:p_raw])
+            self.feed(pids[p_raw:])
+        else:
+            self.feed(pids[p:])
+
     # ---------------- main entry point ----------------
     def gen(self, pids: list[int], max_new: int = 512, stop: list[str] | None = None,
             on_token=None, turn=None, on_serve=None):
@@ -1261,30 +1448,14 @@ class Eng:
         #     losses.  See spec.py.
         if self.ddc is not None:
             if not self.ddc_max_ctx or len(pids) < self.ddc_max_ctx:
-                return self.gen_ddc(pids, max_new, stop, on_token, stopk)
+                return self.gen_ddc(pids, max_new, stop, on_token, stopk, on_serve)
             st["ddc_bypass"] += 1
 
         # 2) APC.  p_raw = the common prefix BEFORE truncation, which is what
         #    separates the two kinds of reuse=0: genuinely no prefix (p_raw=0)
         #    versus a prefix whose truncation failed and cleared everything
         #    (p_raw>0).
-        p_raw = self.lcp(pids)
-        p = p_raw
-        if p < len(self.cur):
-            # Anything short of the KV's end needs a truncation, and a partial
-            # truncation is a no-op on this hybrid memory -- so on its own this
-            # is a full rebuild.  An archived state, if one holds a prefix of
-            # this prompt, is restored whole instead, and seq_cp does do that.
-            hit = self.arc_find(pids) if arc is not None else None
-            if hit is not None:
-                # arc_restore returns the tokens it restored, because the
-                # batched scheduler needs them for its ledger.  What THIS path
-                # wants is how many there are: p is a position, and using the
-                # list itself here is a TypeError on the very next line.
-                p = len(self.arc_restore(hit[0]))
-                self.st["arc_hit"] = self.st.get("arc_hit", 0) + 1
-            elif not self.trunc(p):
-                p = 0
+        p, p_raw = self.plan_prefix(pids, arc)
         new = pids[p:]
         st["reuse"] += p; st["pre"] += len(new)
         if on_serve is not None:
@@ -1294,18 +1465,7 @@ class Eng:
         if p > 0:
             st["apc"] += 1
         t0 = time.time()
-        if new:
-            # Archive the state at the divergence point on the way past it.  That
-            # boundary -- the last position this prompt shares with whatever was
-            # in the KV -- is where a sibling branch diverges too, so it is the
-            # state a fan-out will ask for next, and this is the only moment it
-            # exists.
-            if arc is not None and self.arc_ready(p_raw) and p < p_raw <= len(pids):
-                self.feed(pids[p:p_raw])
-                self.arc_put(pids[:p_raw])
-                self.feed(pids[p_raw:])
-            else:
-                self.feed(new)
+        self.feed_prefix(pids, p, p_raw, arc)
         st["t_pre"] += time.time() - t0
 
         # 3) Token-by-token generation.  A stop string has to be judged BEFORE it
@@ -1406,12 +1566,14 @@ class Eng:
                             "p_raw": p_raw, "cur": len(self.cur)}
 
     def gen_ddc(self, pids: list[int], max_new: int, stop: list[str],
-                on_token, stopk: tuple):
+                on_token, stopk: tuple, on_serve=None):
         """DDC serving path (the 1d branch of gen()).  The exact layers already
         returned upstream, so this is verified draft decoding.
 
-        ddc_decode.generate brings its own prefill (APC), stop handling and
-        UTF-8 handling, and guarantees: only committed tokens are registered (a
+        This path owns the prefill -- APC and, when it is on, the prefix archive
+        (see plan_prefix/feed_prefix) -- and then hands ddc_decode the position
+        it left the KV at.  ddc_decode brings the stop handling and the UTF-8
+        handling, and guarantees: only committed tokens are registered (a
         rejected tail never enters the index), and after a partial acceptance the
         logits are re-read from the committed sequence (a verification copy's
         prediction goes stale after refeeding -- the same trap gen_pl had fixed).
@@ -1421,9 +1583,30 @@ class Eng:
         """
         from ddc_decode import generate as _ddc_gen
         st = self.st
+        # The prefill runs HERE rather than inside ddc_decode, so that the archive
+        # takes part in it.  A restore is only available at this level -- it is a
+        # whole-state copy onto the sequence the decoder is about to use, which is
+        # the one thing ddc_decode does not own -- and the put on the way past a
+        # divergence point is the only thing that ever fills the archive at all.
+        # Since DDC is the default serving path, a prefill that skipped the put
+        # would leave the archive permanently empty and make every restore miss.
+        # The decoder is told what the KV already holds (``reuse``) instead of
+        # working it out for itself from lcp/trunc.
+        arc = getattr(self, "arc", None)
+        p, p_raw = self.plan_prefix(pids, arc)
+        if on_serve is not None:
+            # p is final and nothing has been generated yet, so this is where the
+            # HTTP layer gets its reuse figure into message_start.  Without it a
+            # request that restored an archived state reported a cache read of
+            # zero, which is what the hit-rate tooling reads off the transcript.
+            on_serve(p, "ddc")
+        t0 = time.time()
+        self.feed_prefix(pids, p, p_raw, arc)
+        pre_s = time.time() - t0
         toks, text, ds = _ddc_gen(self, list(pids), max_new,
-                                  cache=self.ddc, stop=tuple(stop), max_context=self.ddc_max_ctx)
-        st["t_pre"] += ds["prefill_seconds"]
+                                  cache=self.ddc, stop=tuple(stop),
+                                  max_context=self.ddc_max_ctx, reuse=p)
+        st["t_pre"] += pre_s + ds["prefill_seconds"]
         st["t_gen"] += ds["generation_seconds"]
         # The governor is fed per ROUND inside ddc_decode, which is finer and
         # sees the state-copy cost of each speculative round.  Reporting the
@@ -1475,6 +1658,7 @@ class Eng:
                f"acc1={s['ddc_acc1']}/tok={s['ddc_tok']} "
                f"bypass={s['ddc_bypass']}/cutoff={s['ddc_cutoff']}/"
                f"gated={s['ddc_gated']}/stood_down={s['ddc_stood_down']} "
+               f"dropped={s.get('ddc_dropped', 0)} "
                f"feat={s['ddc_feature_s']:.1f}s")
         if self.ddc is not None:
             out += " | " + spec.line()

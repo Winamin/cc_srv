@@ -22,7 +22,7 @@ previous prompt plus a few tokens. Four cache layers exploit it, cheapest first.
 Measured on one real session of 20 requests, RTX 5060 Ti: **15 hit a cache layer,
 and 447,657 of the 591,946 prompt tokens (75.6%) were never forwarded to the
 model.** Configuration was `CC_ARCHIVE=1 CC_BATCH=1 CC_BATCH_N=3` — 4 sequences,
-`n_ctx` 524288. The archive excludes the draft cache, so speculative decoding was
+`n_ctx` 524288. The draft cache is off by default, so speculative decoding was
 off for every measurement in this section.
 
 ---
@@ -177,12 +177,12 @@ handled:
 
 ### Beyond the prefix
 
-**Prefix archive.** Sibling subagents share a long prefix but are not extensions
-of each other, so an ordinary prefix cache cannot help them. The archive keeps
-whole KV states at the points where requests actually diverge and restores one
-wholesale. In the session above it served 7 of 20 requests; the clearest was a
-24,775-token prompt that forwarded **2,324** tokens, the other 22,451 already in
-an archived state.
+**Prefix archive.** On by default (`CC_ARCHIVE=0` turns it off). Sibling
+subagents share a long prefix but are not extensions of each other, so an
+ordinary prefix cache cannot help them. The archive keeps whole KV states at the
+points where requests actually diverge and restores one wholesale. In the session
+above it served 7 of 20 requests; the clearest was a 24,775-token prompt that
+forwarded **2,324** tokens, the other 22,451 already in an archived state.
 
 **Batched serving.** A 9B Q4 decode step reads all 5.5 GB of weights whatever it
 produces, so one read can advance several sequences at once. With `CC_BATCH=1`
@@ -208,7 +208,7 @@ prompts, tokens per second:
 |---|---:|---:|---:|
 | `CC_DDC=0` | 69.2 | 69.8 | 69.6 |
 | DDC on, gates off (`CC_SPEC_GOV=0`) | 58.1 | 59.0 | 128.8 |
-| **DDC on, gates live (default)** | **66.6** | **67.9** | **141.5** |
+| **DDC on, gates live** | **66.6** | **67.9** | **141.5** |
 
 The 13% penalty on non-repeating content falls to 3%, and the 2.0x win on
 repeating content holds.
@@ -220,12 +220,42 @@ about one token. `CC_DDC_MAX_CTX` therefore defaults to the sequence's own windo
 and never cuts DDC off early — it survives only as the clamp that keeps a draft
 from running past the end of the context.
 
-One thing that will stop it:
+Two things are worth knowing before turning it on:
 
-- **It cannot run with the archive.** DDC verifies drafts on sequence 1 and
-  clears it every round, and the archive keeps states in the same spare
-  sequences. DDC stands down under `CC_ARCHIVE=1`; setting both by name is
-  refused rather than risking silent corruption.
+- **It is off by default, and it runs with the archive.** The draft cache used to
+  be the default layer and the archive opt-in; that is now the other way round,
+  because the archive is what pays on the shape this server actually sees
+  (fan-out) while speculation is a throughput knob that only pays where the
+  content repeats. The two used to need the same spare sequence, which is why
+  the pair was refused; the verification scratch now gets a sequence of its own
+  and the archive keeps its own, so the layouts are disjoint and
+  `CC_ARCHIVE=1 CC_DDC=4` — or just `CC_DDC=4`, since the archive is on anyway —
+  is served. It costs one sequence on top of the archive's, and with both on,
+  `n_ctx` is multiplied by workers + 1 + archive slots. A request prefills
+  through the archive first and the draft cache then runs on top of whatever
+  prefix that restored; that same prefill is what fills the archive.
+- **The batched scheduler**, via `CC_DDC_BATCH=1`. Without it DDC runs on the
+  serial path only: `CC_BATCH=1` sends every request to the scheduler, which
+  never calls the serial generation path, so no speculation happens however
+  `CC_DDC` is set. The engine says so at startup rather than leaving the
+  counters to sit at zero.
+
+  With it, a verification is one part of the step's batch — a forward pass is
+  what the scheduler exists to share — and the draft is copied aside on a
+  scratch sequence the job holds for its reply. `CC_DDC_BATCH_SCRATCH` (default
+  1) bounds how many requests may speculate at once; each reserved scratch costs
+  one sequence of KV, so at `n_ctx` 131072 that is 1.2 GB per scratch. A round
+  that is only partly accepted is *discarded* rather than committed: committing
+  it would need the accepted prefix re-decoded on the main sequence, a second
+  forward pass this path does not spend. The governor is told the round returned
+  nothing, so a draft length that mostly lands half-way is dropped by the same
+  gate that drops any other losing bucket.
+
+  **This path is new and has not been run.** It is off by default for that
+  reason. Everything the serial path does was measured before it shipped; this
+  was written against the scheduler's documented invariants and reviewed, not
+  executed. Treat `ddc_dropped` and the `spec`/`full` counters as the things to
+  watch first.
 
 ---
 
@@ -237,13 +267,14 @@ Everything is an environment variable.
 
 | variable | default | effect |
 |---|---|---|
-| `CC_DDC` | 4 | draft cache key width; `0` disables. Costs a spare sequence, so `n_ctx` doubles and KV goes 1.2 to 2.4 GB at 131072 |
+| `CC_ARCHIVE` | on | prefix archive. Costs a spare sequence, so `n_ctx` doubles and KV goes 1.2 to 2.4 GB at 131072. Set `CC_ARCHIVE=0` to turn it off |
 
 **Opt-in:**
 
 | variable | default | effect |
 |---|---|---|
-| `CC_ARCHIVE=1` | off | prefix archive. Costs a spare sequence and excludes `CC_DDC`, which stands down for it |
+| `CC_DDC` | off | speculative decoding; `2` or `4` sets the draft cache key width. Costs a spare sequence on top of the archive's |
+| `CC_DDC_BATCH=1` | off | let DDC speculate inside the batched scheduler instead of standing down under `CC_BATCH`. New and unrun — see the DDC section |
 | `CC_QREUSE=1` | off | reuse the reply to a repeated user turn |
 | `CC_BATCH=1` | off | serve concurrent requests in one batch; `CC_BATCH_N` sizes it |
 
@@ -263,6 +294,7 @@ Everything is an environment variable.
 | `CC_SPEC_COOLDOWN` | 64 | rounds before a dropped draft length is re-probed; doubles each time |
 | `CC_SPEC_REP_MIN` | 0.15 | repeat-rate floor, below which DDC stands down |
 | `CC_SPEC_REP_GRACE` | 128 | tokens of grace before DDC may stand down |
+| `CC_DDC_BATCH_SCRATCH` | 1 | scratch sequences the batched scheduler may hand out for DDC rounds. Each one lets another request speculate concurrently, and costs a sequence of KV |
 | `CC_QEDIT` | off | keep the top-k trace that level-2 reuse rewrites from |
 | `CC_QEDIT_SIM` | 0.9 | similarity floor for a level-2 turn |
 | `CC_QREUSE_TOOL` | 0 | allow reuse of a reply to a tool result; see below |
@@ -306,8 +338,11 @@ workers plus 1 archive slot is `n_ctx` x 4, or 4.8 GB of KV at 131072. Lower
   usual reason to disable it is not speed but determinism. A speculative round
   takes a different numerical path, so `CC_DDC=0` if replies must match the plain
   single-token server bit for bit.
-- **The prefix archive** (`CC_ARCHIVE=1`) is the one setting that disables DDC
-  for you, since the two need the same spare sequences.
+- **The prefix archive** is on by default and `CC_DDC` is off by default, which
+  is the opposite of how they used to be. Turning DDC on costs a sequence on top
+  of the archive's — the archive keeps its slots, DDC keeps its verification
+  scratch, and `n_ctx` is multiplied by workers + 1 + archive slots. Neither
+  setting disables the other.
 
 ---
 

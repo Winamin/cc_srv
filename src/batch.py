@@ -41,6 +41,8 @@ import os
 import threading
 import time
 
+import spec
+
 # A step is only batched together with the steps either side of it, so the
 # scheduler needs to know nothing about prompts or stops beyond what a job
 # carries.
@@ -55,7 +57,8 @@ class Job:
     __slots__ = ("prompt", "max_new", "stop", "turn", "seq", "cur", "pos",
                  "out", "raw", "text", "hit", "state", "cursor", "stopped",
                  "done", "result", "error", "t0", "prefilled", "reused",
-                 "arc_at", "arc_done", "on_token", "pf_s", "gn_s", "on_serve")
+                 "arc_at", "arc_done", "on_token", "pf_s", "gn_s", "on_serve",
+                 "ddc", "scratch", "draft", "verifying")
 
     def __init__(self, prompt, max_new, stop, turn=None, on_token=None,
                  on_serve=None):
@@ -87,6 +90,18 @@ class Job:
         # moment it exists is while prefilling through it.
         self.arc_at = None
         self.arc_done = False
+        # Speculative decoding, when CC_DDC_BATCH puts DDC in this scheduler.
+        # ``ddc`` is the draft cache this job may use (None = decode normally),
+        # ``scratch`` the sequence reserved for its verification copies, and
+        # ``draft`` the tokens it is holding for the next step to verify.  A job
+        # without a scratch still decodes normally: speculation here is
+        # opportunistic, never required for correctness.
+        self.ddc = None
+        self.scratch = None
+        self.draft = None
+        # Set by _plan on the part it emits for this job, read by _advance: the
+        # part is a verification pass and carries logits for every position.
+        self.verifying = False
         self.stopped = None
         # Wall time this request spent prefilling vs decoding.  Accumulated per
         # job because a batch serves several at once: one llama_decode covers
@@ -128,6 +143,13 @@ class Batcher:
         # one of those would overwrite an archived state mid-flight, so the
         # scheduler only ever uses the sequences the engine says are free.
         self.seqs = list(getattr(eng, "work_seqs", None) or range(eng.nseq))
+        # DDC's verification sequences, if the layout reserved any.  They are not
+        # in ``seqs`` -- the engine keeps them out of work_seqs precisely so a
+        # scheduler cannot hand one out as somebody's main sequence -- and a job
+        # holds one for the whole of its reply, so the pool is a bound on how
+        # many requests may speculate at once rather than on correctness.
+        self.ddc_pool = list(getattr(eng, "ddc_pool", None) or [])
+        self.ddc_used = set()
         self.jobs: list[Job] = []
         self.queued: list[Job] = []
         self.lock = threading.Lock()
@@ -261,6 +283,7 @@ class Batcher:
                 continue
             job.seq = best
             cur = self._seq_tokens(best)
+            self._ddc_claim(job)
 
             # Nothing on a sequence fits.  An archived state might: that is what
             # the archive is for, and it is what a sibling subagent needs.
@@ -344,6 +367,209 @@ class Batcher:
                 return j.cur
         return self.e.seq_tokens.get(seq, [])
 
+    # ---------------- speculative decoding (CC_DDC_BATCH) ----------------
+    # DDC's round, as the scheduler sees it.  The serial path (ddc_decode.py)
+    # runs the same three movements -- copy the committed state aside, write the
+    # whole draft into the copy in one pass, keep the prefix the target model
+    # agreed with -- but it owns the context while it does, so it can issue the
+    # verification as its own decode.  Here the verification is a part of the
+    # step's batch like any other, which is the whole reason for the work: a
+    # verification pass is a forward pass, and a forward pass is what the
+    # scheduler exists to share.
+    #
+    # Two differences from the serial path, both deliberate:
+    #
+    #  * A round that is only PARTLY accepted is discarded rather than committed.
+    #    Committing it needs the accepted prefix re-decoded on the main sequence
+    #    (the scratch copy is all-or-nothing; hybrid memory cannot truncate it
+    #    back), which is a second forward pass and a second job state.  Dropping
+    #    the round instead leaves the main sequence exactly where it was, and the
+    #    governor is told it returned zero tokens -- so a draft length that
+    #    mostly lands half-way is dropped by the same gate that drops any other
+    #    losing bucket, and one that lands whole keeps its ~3x.
+    #  * The spec.py governor is global, so DDC jobs running concurrently share
+    #    one grace window and one set of buckets.  Its measurements are
+    #    per-round and add up either way; what they cannot do is attribute a
+    #    stand-down to one request rather than another.
+    def _ddc_claim(self, job):
+        """Give this job a scratch sequence to verify drafts on, if one is free.
+
+        A job that gets none is not a failure -- it decodes one token at a time,
+        exactly as it would with DDC off.  Speculation here is opportunistic.
+        """
+        e = self.e
+        cache = getattr(e, "ddc", None)
+        if cache is None or not self.ddc_pool:
+            return
+        # Past its cutoff the cache stands down for this request anyway, so the
+        # sequence would be held for nothing.
+        if e.ddc_max_ctx and len(job.prompt) >= e.ddc_max_ctx:
+            return
+        free = [s for s in self.ddc_pool if s not in self.ddc_used]
+        if not free:
+            return
+        job.ddc = cache
+        job.scratch = free[0]
+        self.ddc_used.add(free[0])
+        cache.begin()
+        spec.begin_request()
+        e.st["ddc_req"] = e.st.get("ddc_req", 0) + 1
+
+    def _ddc_release(self, job):
+        """Hand a job's scratch sequence back to the pool."""
+        if job.scratch is not None:
+            self.ddc_used.discard(job.scratch)
+            job.scratch = None
+        job.draft = None
+
+    def _index_and_offer(self, job, row, token):
+        """Index a produced token against the row that predicted it, then offer a draft.
+
+        Both halves matter and they share one full-vocabulary scan.  The index is
+        the bootstrap of the whole feature: a draft is looked up in it, so a path
+        that never indexes never drafts -- and a round is the only other thing
+        that indexes, so a path that only indexed round tokens would never
+        produce a first one.  The first batched run did exactly that and
+        speculated zero rounds with a full pool.
+
+        The governor's per-token note is unconditional.  It is the repetition
+        detector, and it has to keep running while DDC is stood down or it could
+        never see the content turn repetitive and switch back on.
+        """
+        spec.note_token(token)
+        if job.ddc is None:
+            return
+        # The scan is the fixed cost the gate exists to avoid: standing down
+        # after paying it would save nothing, so it is checked first.
+        if not spec.paying():
+            return
+        from ddc import features
+        e = self.e
+        # Timed into the same counter the serial path reports it under.  This is
+        # the cost the gate's second half is about -- a full-vocabulary pass per
+        # committed token, measured at 7.9% of generation time -- and a batched
+        # run that left it at zero would make /stats claim the scan is free.
+        t0 = time.perf_counter()
+        first = features(row)
+        e.st["ddc_feature_s"] = e.st.get("ddc_feature_s", 0.0) + (
+            time.perf_counter() - t0)
+        job.ddc.append(token, first[0], first[1])
+        self._offer(job, first, token)
+
+    def _offer(self, job, first, nxt):
+        """Look a draft up for the position this row opens, and hold it for the next step."""
+        if job.draft is not None:
+            return
+        e = self.e
+        room = min(job.max_new - len(job.out), e.window - job.pos)
+        if e.ddc_max_ctx:
+            room = min(room, e.ddc_max_ctx - job.pos)
+        if room < 2:                      # the cache wants two tokens to be worth it
+            return
+        proposal = job.ddc.propose(first[0], nxt, room)
+        spec.note_offer(len(proposal.tokens) if proposal is not None else 0)
+        if proposal is None or not spec.allow(len(proposal.tokens)):
+            return
+        job.draft = list(proposal.tokens)
+
+    def _finish_round(self, job, first_idx):
+        """Turn a verification pass into committed tokens.  -> (draft, committed).
+
+        Everything is read out of the logits rows before anything else runs: they
+        are views into the buffer the next step's decode overwrites, so the
+        accepted count, the next pending token and the per-position features all
+        have to be taken now.
+
+        The scan starts at one because a proposal's first token is the model's
+        own next token by construction -- ddc.propose refuses any trace whose
+        token at that position is not ``next_token`` -- so it is the one position
+        with nothing to verify, and the draft is written from it.
+        """
+        from ddc import features
+        e, L = self.e, self.e.L
+        draft = job.draft
+        k = len(draft)
+        count = 1
+        while count < k:
+            if int(e.logits_row(first_idx + count - 1).argmax()) != draft[count]:
+                break
+            count += 1
+        accepted = draft[:count]
+        pending = None
+        if count == k:
+            # The copy IS the committed state now: one seq_cp moves it back and
+            # no forward pass is needed, which is where the ~3x comes from.
+            L.llama_memory_seq_rm(e.kmem, job.seq, 0, -1)
+            L.llama_memory_seq_cp(e.kmem, job.scratch, job.seq, 0, -1)
+            pending = int(e.logits_row(first_idx + k - 1).argmax())
+        # Cleared whether or not the round was kept: the scratch never survives
+        # the round, and a rejected tail must not be left where the next round
+        # would copy from it.
+        L.llama_memory_seq_rm(e.kmem, job.scratch, 0, -1)
+        job.draft = None
+        e.st["ddc_spec"] = e.st.get("ddc_spec", 0) + 1
+        e.st["ddc_full"] = e.st.get("ddc_full", 0) + (count == k)
+        e.st["ddc_acc1"] = e.st.get("ddc_acc1", 0) + (count == 1)
+        e.st["ddc_tok"] = e.st.get("ddc_tok", 0) + count
+        if count < k:
+            # Partial: given up, so nothing was committed, indexed or noted.  The
+            # only real token in the round is draft[0] -- this round's pending
+            # token, which the step that offered the draft already indexed
+            # against the row that predicted it -- and the rest never entered the
+            # sequence, so indexing them would teach later requests tokens this
+            # model never chose.
+            #
+            # The per-position features are NOT extracted either.  That scan is
+            # the fixed cost of a round, and a round being thrown away must not
+            # pay it, or the gate would compare a round's real cost against a
+            # number that left its largest term out.
+            e.st["ddc_dropped"] = e.st.get("ddc_dropped", 0) + 1
+            return k, 0
+        # Kept: features for the committed positions, read while the rows are
+        # still live.  draft[0] is skipped -- see above, the previous step
+        # indexed it -- so this list pairs with accepted[1:].
+        t_feat = time.perf_counter()
+        descs = [features(e.logits_row(first_idx + i)) for i in range(count - 1)]
+        e.st["ddc_feature_s"] = e.st.get("ddc_feature_s", 0.0) + (
+            time.perf_counter() - t_feat)
+        # The whole draft is in the main sequence now.  cur takes all of it: that
+        # is what the KV holds.  out takes it one token at a time, alongside its
+        # text, because _emit decides max_new and the stop strings on the output
+        # it has already been given -- extending out first would let a round that
+        # crossed the limit finish the job with its own tokens unemitted.
+        job.cur.extend(accepted)
+        job.pos += k
+        # Index the committed tokens against the features that preceded them.
+        # Only committed tokens go in: a rejected tail would poison the index
+        # with tokens this model never chose.
+        for t, (ids, gaps) in zip(accepted[1:], descs):
+            job.ddc.append(t, ids, gaps)
+            spec.note_token(t)
+        # draft[0] is deliberately not emitted: it is the pending token out[-1]
+        # that this round just committed, and the batcher's ledger is
+        # cur == prompt + out[:-1], which appending it again would break.
+        for t in accepted[1:]:
+            job.out.append(t)
+            self._emit(job, t)
+            if job.state == DONE:
+                return k, count
+        if job.pos >= e.window:
+            # The main sequence is full.  Stop here rather than let the next
+            # step decode one position past the cells, which fails the whole
+            # batch and every other request sharing it.
+            job.stopped = None
+            job.text = "".join(job.raw)
+            job.finish()
+            return k, count
+        job.out.append(pending)
+        self._emit(job, pending)
+        if job.state != DONE:
+            # The pending token is a produced token like any other: it gets
+            # indexed against the row that predicted it, and that is also where
+            # the next round's draft is looked up.
+            self._index_and_offer(job, e.logits_row(first_idx + k - 1), pending)
+        return k, count
+
     def _retire(self):
         """Hand finished jobs back and free their sequences.
 
@@ -355,6 +581,7 @@ class Batcher:
             if j.state != DONE:
                 continue
             self.jobs.remove(j)
+            self._ddc_release(j)
             self.e.seq_tokens[j.seq] = list(j.cur)
             with self.state_lock:
                 if j.out:
@@ -388,6 +615,25 @@ class Batcher:
         for job in decoding:
             if budget < 1:
                 break
+            if job.draft is not None and job.scratch is not None and len(job.draft) <= budget:
+                # The part is the whole draft written into the job's scratch
+                # sequence, with a logits row per position.
+                job.verifying = True
+                parts.append((job.scratch, job.pos, job.draft, job))
+                budget -= len(job.draft)
+                continue
+            if job.draft is not None:
+                # Not verified this step, and the job must not decode a token
+                # instead: the draft was proposed for the position the job is at
+                # NOW, and advancing it by one would leave the draft describing
+                # the wrong one.  The first token of a draft is never verified (a
+                # proposal always opens with the model's own next token), so a
+                # stale draft would commit that token unverified -- the draft
+                # goes, the decode stays.  Whichever of the two reasons brought
+                # us here (no scratch, or no budget for the whole draft), this is
+                # the only safe thing to do with it.
+                job.draft = None
+            job.verifying = False
             parts.append((job.seq, job.pos, [job.out[-1]], job))
             budget -= 1
 
@@ -397,6 +643,7 @@ class Batcher:
             for job in prefilling:
                 if budget <= 0:
                     break
+                job.verifying = False
                 take = min(self.chunk, share, budget, len(job.prompt) - job.cursor)
                 if job.arc_at is not None and not job.arc_done:
                     # Land the chunk exactly on the boundary so the state there
@@ -425,7 +672,17 @@ class Batcher:
         """Decode one step for every part and give each job its own logits row."""
         e, L = self.e, self.e.L
         t_step = time.perf_counter()
-        b, keep, idx = e.batch_parts([(s, p, t) for s, p, t, _ in parts])
+        # A verification needs the committed state copied aside first: the draft
+        # is written into the copy, never into the real sequence, because a
+        # rejected tail cannot be truncated away on this hybrid memory.  The copy
+        # cannot be made later -- it has to be the state as it stands before this
+        # step's decode touches anything.
+        for seq, pos0, toks, job in parts:
+            if job.verifying:
+                L.llama_memory_seq_rm(e.kmem, job.scratch, 0, -1)
+                L.llama_memory_seq_cp(e.kmem, job.seq, job.scratch, 0, -1)
+        b, keep, idx, first = e.batch_parts(
+            [(s, p, t, j.verifying) for s, p, t, j in parts])
         if L.llama_decode(e.ctx, b) != 0:
             import os as _os
             if _os.environ.get("BATCH_DBG"):
@@ -438,7 +695,7 @@ class Batcher:
                 # engine state.  If the parts decode individually, the batch is
                 # what is wrong; if not, the state is.
                 for s, p, t, _ in parts:
-                    bb, kk, ii = e.batch_parts([(s, p, t)])
+                    bb, kk, ii, ff = e.batch_parts([(s, p, t)])
                     print(f"  alone seq={s} pos={p} n={len(t)} -> "
                           f"rc={L.llama_decode(e.ctx, bb)}", flush=True)
             raise RuntimeError("batched decode failed")
@@ -451,8 +708,15 @@ class Batcher:
         # prompt as decode time.
         was_prefill = [job.state == PREFILL for _, _, _, job in parts]
         n_tok = sum(len(t) for _, _, t, _ in parts)
+        # Rounds are reported to the governor after the step's cost is known,
+        # because what it compares is tokens returned against time spent and the
+        # step's wall time is only available here.
+        rounds = []
         for k, (seq, pos0, toks, job) in enumerate(parts):
             row = e.logits_row(idx[k])
+            if job.verifying:
+                rounds.append(self._finish_round(job, first[k]))
+                continue
             token = int(row.argmax())
             if job.state == PREFILL:
                 job.cursor += len(toks)
@@ -467,6 +731,10 @@ class Batcher:
                     job.state = DECODE
                     job.out.append(token)
                     self._emit(job, token)
+                    if job.state != DONE:
+                        # The first row is a decode row like any other, so this
+                        # is where a reply starts feeding the draft index.
+                        self._index_and_offer(job, row, token)
             else:
                 job.pos = pos0 + 1
                 job.cur.append(toks[0])
@@ -480,6 +748,8 @@ class Batcher:
                     job.stopped = None
                     job.text = "".join(job.raw)
                     job.finish()
+                elif job.state != DONE:
+                    self._index_and_offer(job, row, token)
 
         # Split the step's wall time across its parts by token count.  A prefill
         # chunk is up to a hundred tokens and a decode is one, so token share is
@@ -500,6 +770,16 @@ class Batcher:
             # "prefill 0.0s + decode 0.0s".
             self.e.st["t_pre"] += dt * n_pre / n_tok
             self.e.st["t_gen"] += dt * (n_tok - n_pre) / n_tok
+            # The governor's plain-decoding yardstick.  A batched decode step is
+            # exactly one token decoded one at a time, which is what it measures
+            # -- charged its share of the step, the same way the job's own
+            # counters are.
+            for pre, (_, _, toks, job) in zip(was_prefill, parts):
+                if not pre and not job.verifying:
+                    spec.note_sequential(1, dt * len(toks) / n_tok)
+            for draft_len, committed in rounds:
+                spec.note_round(draft_len, committed,
+                                dt * draft_len / n_tok)
 
     def _emit(self, job, token):
         """Append a token's text and apply the stop strings.
@@ -563,6 +843,11 @@ class Batcher:
                         self.e.clear_seq(seq)
                     except Exception:
                         pass
+                # The scratches in that set were cleared with everything else, so
+                # all that is left is to hand them back -- dropping the job list
+                # below would otherwise strand every one of them.
+                for j in live:
+                    self._ddc_release(j)
                 self.st["failed"] = self.st.get("failed", 0) + 1
                 self.log(f"batch failed ({ex!r}); cleared sequences "
                          f"{sorted({s for s, _, _, _ in parts})}, jobs lost: "
