@@ -717,6 +717,18 @@ class Api(BaseHTTPRequestHandler):
                 ensure_start()        # never let content precede message_start
                 return sse(self, ev, data)
 
+        def ping():
+            # Deliberately NOT emit(): emit runs ensure_start, and a ping fired
+            # while the serving layer is still undecided -- the engine lock held
+            # by another request's long generation, or a batcher job queued
+            # behind a busy home worker -- would push message_start out with
+            # cache_read=0, and message_start is exactly the frame Claude Code
+            # records.  A ping before message_start is legal SSE, so it goes
+            # out alone; the write still takes emit0, because the generation
+            # thread may be emitting deltas concurrently.
+            with emit0:
+                return sse(self, "ping", {"type": "ping"})
+
         st = Streamer(stops, think=think_on, opened=think_on) if STREAM else None
         # Which content block the deltas belong to.  A thinking block has to be
         # opened, filled and closed before the text block opens, so the two
@@ -795,7 +807,7 @@ class Api(BaseHTTPRequestHandler):
         # every reply to the next 6 s boundary: a cache hit answered in 1 ms
         # still reached the client 6 s later.
         while not done.wait(6.0):
-            emit("ping", {"type": "ping"})    # keep an idle watchdog from cutting the stream
+            ping()    # keep an idle watchdog from cutting the stream
         if box[1] is not None:
             # The response headers are already sent, so the only honest report is
             # an SSE error event, then close.
