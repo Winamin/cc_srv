@@ -531,13 +531,12 @@ class Api(BaseHTTPRequestHandler):
 
         def run(on_token=None, on_serve=None):
             t = time.time()
+            shared = False
             if BATCHER is not None:
                 # The scheduler already runs requests concurrently; a lock here
-                # would put back the serialisation it exists to remove.  The
-                # KV-free layers are reached inside run_job, which guards them.
+                # would put back the serialisation it exists to remove.  The KV-free
+                # layers are reached inside run_job, which guards them.
                 t0 = time.time()
-                pre_before, gen_before = E.st["t_pre"], E.st["t_gen"]
-                arc_before = E.st.get("arc_s", 0.0)
                 r = run_job(E, BATCHER, ids, mx, stops, turn, on_token, on_serve)
             else:
                 with LK:
@@ -560,18 +559,28 @@ class Api(BaseHTTPRequestHandler):
             # 25k and generated 76 -- measured: 12.3 s against 11.8 s, with the
             # reuse actually saving 8.2 s.  Without the split that reads as "the
             # cache made it slower", which is how it got read.
-            # The batched path reports these per request.  A batch serves several
-            # requests in one llama_decode, so the engine-level counters cannot
-            # separate them and the deltas below would credit this request with
-            # its neighbours' prefill time; the serial path has no per-job figure
-            # and falls back to the deltas, which are exact there.
-            pf = info.get("pf")
-            gn = info.get("gn")
-            if pf is None:
-                pf = E.st["t_pre"] - pre_before
-            if gn is None:
-                gn = E.st["t_gen"] - gen_before
-            arcd = E.st.get("arc_s", 0.0) - arc_before
+            if BATCHER is not None:
+                # The engine's global counters are useless here: the worker
+                # threads advance t_pre/t_gen for concurrent jobs, so a delta
+                # would credit this request with its neighbours' work.  A batch
+                # job carries its own token-share split and its own measured
+                # archive-restore time; a probe hit did no prefill, no decode
+                # and no restore at all, so all three are zero -- never a
+                # global delta.
+                pf = info.get("pf") or 0.0
+                gn = info.get("gn") or 0.0
+                arcd = info.get("arc") or 0.0
+                shared = bool(info.get("shared"))
+            else:
+                # The serial path has no per-job figure; the deltas were taken
+                # inside the engine lock, so they are exactly this request's.
+                pf = info.get("pf")
+                gn = info.get("gn")
+                if pf is None:
+                    pf = E.st["t_pre"] - pre_before
+                if gn is None:
+                    gn = E.st["t_gen"] - gen_before
+                arcd = E.st.get("arc_s", 0.0) - arc_before
             sec = time.time() - t0
             # Whatever the two counters did not claim.  A batched request is only
             # advanced on the steps it appears in, and _admit can put it straight
@@ -609,10 +618,15 @@ class Api(BaseHTTPRequestHandler):
             msg = (f"{len(ids)}+{out_n} {C(info['hit'], hit_c)} "
                    f"pre={info.get('pre')} reuse={info.get('reuse')} "
                    f"p_raw={info.get('p_raw','-')} cur={info.get('cur','-')} "
-                   f"{sec:.1f}s (prefill {pf:.1f}s + decode {gn:.1f}s")
-            if wait > 0.05:
-                msg += f" + {C('wait', 'yellow')} {wait:.1f}s"
-            msg += ")"
+                   f"{sec:.1f}s")
+            if not shared:
+                # A step shared with other jobs makes the split a token-count
+                # allocation rather than a measurement of this request alone,
+                # so it is not displayed; record() still carries the shares.
+                msg += f" (prefill {pf:.1f}s + decode {gn:.1f}s"
+                if wait > 0.05:
+                    msg += f" + {C('wait', 'yellow')} {wait:.1f}s"
+                msg += ")"
             if rates:
                 msg += " " + " ".join(rates)
             if arcd > 0.001:

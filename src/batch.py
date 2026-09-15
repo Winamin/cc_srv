@@ -58,7 +58,7 @@ class Job:
                  "out", "raw", "text", "hit", "state", "cursor", "stopped",
                  "done", "result", "error", "t0", "prefilled", "reused",
                  "arc_at", "arc_done", "on_token", "pf_s", "gn_s", "on_serve",
-                 "ddc", "scratch", "draft", "verifying")
+                 "ddc", "scratch", "draft", "verifying", "shared", "arc_s")
 
     def __init__(self, prompt, max_new, stop, turn=None, on_token=None,
                  on_serve=None):
@@ -109,6 +109,16 @@ class Job:
         # counters cannot tell one request's prefill from its neighbours'.
         self.pf_s = 0.0
         self.gn_s = 0.0
+        # Wall time of this job's own archive restore.  The engine's global
+        # arc_s cannot be split across concurrent jobs, so the per-job figure
+        # is captured at the restore site in _admit and travels out through
+        # run_job's info.
+        self.arc_s = 0.0
+        # Whether any step this job took part in also carried another job's
+        # part.  A shared step makes pf_s/gn_s a token-count allocation rather
+        # than a measurement of this request alone; the HTTP layer uses this to
+        # leave the prefill/decode split out of the request log.
+        self.shared = False
         self.done = threading.Event()
         self.result = None
         self.error = None
@@ -290,7 +300,13 @@ class Batcher:
             if self.e.arc is not None and usable < self.e.arc_min:
                 hit = self.e.arc_find(job.prompt)
                 if hit is not None and hit[1] > usable:
+                    # Timed here rather than read off the engine's global arc_s:
+                    # while this restore runs, a concurrent admission may run
+                    # one too, and a delta of the shared counter would credit
+                    # this request with its neighbour's restore.
+                    _t0 = time.perf_counter()
                     self.e.arc_restore(hit[0], best)
+                    job.arc_s = time.perf_counter() - _t0
                     self.e.st["arc_hit"] = self.e.st.get("arc_hit", 0) + 1
                     self._start(job, hit[1], "arc")
                     continue
@@ -703,6 +719,14 @@ class Batcher:
         self.st["steps"] += 1
         self.st["batched_tokens"] += b.n_tokens
         self.st["peak_seq"] = max(self.st["peak_seq"], len(parts))
+        if len(parts) > 1:
+            # Every part in this step shares one llama_decode, so from here on
+            # each job's pf_s/gn_s split is an allocation by token count, not a
+            # clock it owns.  Flagged for the HTTP layer, which suppresses the
+            # prefill/decode display for such a request instead of showing a
+            # number that reads more precise than it is.
+            for _, _, _, job in parts:
+                job.shared = True
         # Captured before the loop below, which flips a finished prefill to
         # DECODE -- reading state afterwards would file the last chunk of every
         # prompt as decode time.
@@ -898,5 +922,6 @@ def run_job(engine, batcher, prompt, max_new, stop, turn=None, on_token=None,
     info = {"hit": job.hit, "pre": job.prefilled - job.reused,
             "reuse": job.reused, "cur": len(job.cur),
             "stop": job.stopped, "trunc": job.stopped is None,
-            "seq": job.seq, "pf": job.pf_s, "gn": job.gn_s}
+            "seq": job.seq, "pf": job.pf_s, "gn": job.gn_s,
+            "arc": job.arc_s, "shared": job.shared}
     return job.out, job.text, info
