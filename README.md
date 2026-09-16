@@ -175,6 +175,45 @@ handled:
   into two extra newlines, enough on its own to zero out a thousand tokens of
   reuse. They are dropped.
 
+### Thinking, and why `CC_THINK=0` is a lock
+
+The model writes its reasoning inside `<think>...</think>`. By default it is
+stripped before it reaches the client, but "stripped" is not the same as "off":
+reasoning can be switched on from three independent places, and a setting that
+closes only one of them does not do what it says.
+
+| source | how it turns reasoning on | closed by `CC_THINK=0` |
+|---|---|---|
+| the live switch | `GET /think?on=1` | yes — the request is **refused**, not obeyed |
+| the client | an Anthropic `thinking` field in the request, which Claude Code sends | yes |
+| the history | thinking blocks already in the transcript, re-rendered into the prompt as `<think>...</think>` | yes — the reasoning body is dropped, the token cost with it |
+
+The third one is the easy one to miss, and the one that matters most: re-sending
+a transcript's reasoning is itself an instruction to keep reasoning, so a server
+that stripped only the *output* would still be asking the model to think on every
+turn after a thinking turn.
+
+So `CC_THINK=0` is read once at startup as a hard lock. With it set,
+`want_think()` returns `False` unconditionally, `/think?on=1` answers
+`{"think": false, "locked": true}` instead of switching anything, and history is
+rendered with its reasoning stripped — as the plain closed empty block
+`<think>\n\n</think>\n\n`, which is also the shape the non-thinking path uses, so
+the prefix stays stable. Restarting with `CC_THINK=1` is the only way back on; a
+lock a runtime call can undo is not a lock.
+
+Note the asymmetry this leaves in place. A closed empty block still tells the
+model *"your reasoning is already finished"* rather than telling it not to
+reason, because that is the header the re-rendered history is matched against
+byte for byte. `CC_THINK=0` guarantees no reasoning reaches the client and no
+recorded reasoning re-enters the prompt; it is not a claim about what the model
+does internally.
+
+Switching the setting changes the prompt header, so the prefix changes with it
+and the next request pays one cold prefill. That is inherent in changing what the
+model is asked, not something the server can avoid. A request that asked for
+thinking while the lock is set logs `locked` instead of `req`, so a refusal is
+visible rather than looking like a hit.
+
 ### Beyond the prefix
 
 **Prefix archive.** On by default (`CC_ARCHIVE=0` turns it off). Sibling
@@ -299,6 +338,7 @@ Everything is an environment variable.
 | `CC_QEDIT_SIM` | 0.9 | similarity floor for a level-2 turn |
 | `CC_QREUSE_TOOL` | 0 | allow reuse of a reply to a tool result; see below |
 | `CC_STREAM` | 1 | stream text while the model is still generating |
+| `CC_THINK` | 0 | `0` is a **hard lock**: no reasoning this process, from any source. `1` allows it |
 | `CC_LOG` | `info` | `debug` / `info` / `warn` / `error` / `off` |
 | `CC_LOGDIR` | `./logs` | where `server.log` and `requests.jsonl` go |
 
