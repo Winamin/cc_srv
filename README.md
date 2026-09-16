@@ -62,6 +62,29 @@ Requests land in `logs/server.log`:
 A 52,039-token prompt, 51,962 of it served from cache, 77 forwarded, 1.0 s. The
 prefill/decode split reads zero on the batched path; only the total is real.
 
+While a prompt is being forwarded, each request reports its own progress:
+
+```
+2026-09-16 22:28:14 [INFO ] [cc_srv] prefill  10.0% (11763/117636 tok seq=0)
+2026-09-16 22:28:15 [INFO ] [cc_srv] prefill  62.2% (73169/117636 tok seq=0)
+2026-09-16 22:28:16 [INFO ] [cc_srv] prefill 100.0% (117636/117636 tok seq=0)
+```
+
+The percentage is of the tokens **this request forwards**, not of the prompt:
+a request served from the cache that forwards 300 tokens of a 50k prompt reads
+as nearly done, because that is the work it is actually paying for. `seq=` is
+the sequence the scheduler handed the job, which is what makes concurrent
+prefills readable when a fan-out interleaves them.
+
+One line per step crossed, at most one per forward pass. `CC_PROGRESS_STEP`
+sets the step; `CC_PROGRESS=0` turns it off entirely. The reason this is
+computed here rather than taken from llama.cpp's own `Prompt processing
+progress` is granularity: this engine forwards in chunks of at most `bs` tokens
+so a long prefill can share a step with requests that are already decoding, and
+the C-level message is emitted per forward pass with no idea which request it
+belongs to. On the 117,636-token prompt above that is over 900 identical lines,
+several of them interleaved from concurrent jobs.
+
 ---
 
 ## What the cache does to a session
@@ -228,6 +251,36 @@ produces, so one read can advance several sequences at once. With `CC_BATCH=1`
 concurrent requests share a forward pass: 3.3x the decode throughput of serving
 them one at a time.
 
+### The two batch sizes, and why they are separate knobs
+
+`CC_N_BATCH` and `CC_N_UBATCH` default to 2048 and 512, matching LM Studio's
+*evaluation batch size* and *physical batch size* for the same model on the same
+card — so the two servers are a like-for-like comparison out of the box. They
+were hardcoded at 512 and 128 before.
+
+| | `CC_N_BATCH` (2048) | `CC_N_UBATCH` (512) |
+|---|---|---|
+| what it bounds | tokens in one `llama_decode` | tokens in one GPU forward pass |
+| what it speeds up | Python-side bookkeeping | **prefill throughput** |
+| VRAM cost | almost none | **linear** — the compute buffer is `n_ubatch × n_embd` |
+| who else reads it | `Batch._plan` sizes each step's token budget from it | nobody |
+
+They are not interchangeable. When `n_batch > n_ubatch`, llama.cpp splits the
+logical batch into several forward passes, so raising `n_batch` alone buys
+nothing but shorter bookkeeping — `n_ubatch` is the one that moves prefill
+speed. It is also the one that runs the card out of memory, which at
+`n_ctx` 524288 with Q4_0 KV is a real risk. `n_ubatch > n_batch` is rejected at
+startup, with a message naming both settings rather than a bare assert.
+
+One coupling was deliberately cut. The scheduler takes each prefill chunk as
+`eng.bs // 4`, which was 128 while `n_batch` was 512 — but raising `n_batch` to
+2048 would have made that 512, and a prefill taking 512 tokens out of a step is
+exactly the shape that produced the measured **p90 of 199 s**: one arriving
+prompt eating the step while the sequences already decoding got no token at all.
+The chunk is now capped at 128 independently of `n_batch`, and `CC_BATCH_CHUNK`
+sets it directly. The *step budget* still scales with `n_batch`, which is what
+that setting should control.
+
 **Speculative decoding.** `CC_DDC` reuses continuations the model has already
 produced and verifies them in a batch. Drafts come from the context itself, so
 the only cost is verification, and a round is roughly 3x faster when the draft
@@ -325,6 +378,11 @@ Everything is an environment variable.
 | `CC_ARCHIVE_MIN` | 512 | shortest prefix worth archiving |
 | `CC_BATCH_N` | 4 | worker sequences, i.e. concurrent requests |
 | `CC_BATCH_WAIT` | 512 | prefix tokens worth giving up to avoid waiting for the busiest worker |
+| `CC_N_BATCH` | 2048 | logical batch: the most tokens one `llama_decode` may carry. Also sizes each scheduler step's token budget |
+| `CC_N_UBATCH` | 512 | physical batch: what one GPU forward pass computes. Must be ≤ `CC_N_BATCH`. Costs VRAM linearly |
+| `CC_BATCH_CHUNK` | 128 | most prompt tokens one prefill may take from a step. Deliberately not tied to `CC_N_BATCH` |
+| `CC_PROGRESS` | 1 | report prefill progress; `0` turns it off |
+| `CC_PROGRESS_STEP` | 10 | percent between progress lines; `0` silences it too |
 | `CC_DDC_M` | 32 | draft length cap; the truncation threshold usually binds first |
 | `CC_DDC_T` | 0.5 | draft truncation threshold, lower means longer drafts. At `M=32/T=0.5` drafts run 15 to 22 tokens |
 | `CC_DDC_MAX_CTX` | window | length at which the draft cache stands down; defaults to the sequence's own window, `0` removes the clamp entirely |
@@ -339,6 +397,8 @@ Everything is an environment variable.
 | `CC_QREUSE_TOOL` | 0 | allow reuse of a reply to a tool result; see below |
 | `CC_STREAM` | 1 | stream text while the model is still generating |
 | `CC_THINK` | 0 | `0` is a **hard lock**: no reasoning this process, from any source. `1` allows it |
+| `CC_PROGRESS` | 1 | report prefill progress; `0` turns it off |
+| `CC_PROGRESS_STEP` | 10 | percent between progress lines; `0` silences it too |
 | `CC_LOG` | `info` | `debug` / `info` / `warn` / `error` / `off` |
 | `CC_LOGDIR` | `./logs` | where `server.log` and `requests.jsonl` go |
 

@@ -42,6 +42,7 @@ import threading
 import time
 
 import spec
+from eng import Progress
 
 # A step is only batched together with the steps either side of it, so the
 # scheduler needs to know nothing about prompts or stops beyond what a job
@@ -58,7 +59,8 @@ class Job:
                  "out", "raw", "text", "hit", "state", "cursor", "stopped",
                  "done", "result", "error", "t0", "prefilled", "reused",
                  "arc_at", "arc_done", "on_token", "pf_s", "gn_s", "on_serve",
-                 "ddc", "scratch", "draft", "verifying", "shared", "arc_s")
+                 "ddc", "scratch", "draft", "verifying", "shared", "arc_s",
+                 "prog")
 
     def __init__(self, prompt, max_new, stop, turn=None, on_token=None,
                  on_serve=None):
@@ -119,6 +121,11 @@ class Job:
         # than a measurement of this request alone; the HTTP layer uses this to
         # leave the prefill/decode split out of the request log.
         self.shared = False
+        # This job's own prefill progress reporter, or None (see eng.Progress).
+        # Per job, not per engine: the scheduler advances several prefills in one
+        # step, so a shared reporter would attribute each job's chunks to whoever
+        # reported last.
+        self.prog = None
         self.done = threading.Event()
         self.result = None
         self.error = None
@@ -142,7 +149,17 @@ class Batcher:
         # Prefill is chunked so that a long prompt does not monopolise a step:
         # chunking is what lets a request that is still prefilling share the
         # batch with requests that are already decoding.
-        self.chunk = chunk or max(64, eng.bs // 4)
+        #
+        # Deliberately NOT tied to eng.bs any more.  It was bs // 4, which was
+        # the same thing as "a quarter of a step" only while bs was 512; raising
+        # n_batch to match LM Studio's 2048 would have quadrupled the chunk to
+        # 512 tokens, and a prefill that large is exactly the shape that produced
+        # the measured p90 of 199 s -- one arriving prompt eating the whole step
+        # while the sequences already decoding got nothing.  The step budget is
+        # what should scale with n_batch; the share any single prefill may take
+        # of it is a separate question, and CC_BATCH_CHUNK answers it directly.
+        self.chunk = chunk or int(os.environ.get("CC_BATCH_CHUNK", "0") or 0) \
+            or max(64, min(eng.bs // 4, 128))
         # How much better the busy home worker's prefix must be before it is
         # worth waiting for.  Waiting is not free: in a fan-out the home worker
         # is often mid-generation, and a free worker holding almost as long a
@@ -367,6 +384,13 @@ class Batcher:
         # exactly the three outcomes the archive work is trying to move between.
         job.hit = ("batch_arc" if how == "arc"
                    else "batch_apc" if reused else "batch_cold")
+        # Progress for this job's prefill, sized by what it will actually
+        # forward.  ``reused`` has already been clamped above, so this is the
+        # same number _plan will drain: the cursor advances from reused to
+        # len(prompt), and the percentage is of that span.  Labelled with the
+        # sequence so concurrent prefills can be told apart in the log -- a
+        # fan-out runs several at once and they interleave line by line.
+        job.prog = Progress(len(job.prompt) - reused, self.log, job.seq)
         # Report the decision now, not at retirement.  Everything above happens
         # before a single token of this request is produced, which is the whole
         # reason the hook exists here rather than on the finished job.
@@ -747,6 +771,12 @@ class Batcher:
                 job.pos = pos0 + len(toks)
                 job.cur.extend(toks)
                 job.prefilled += len(toks)
+                # Charged here, where the tokens have actually been forwarded,
+                # rather than in _plan where they were merely scheduled: a part
+                # that never reaches this loop (a failed decode, a job dropped
+                # from the batch) must not report progress it did not make.
+                if job.prog is not None:
+                    job.prog.add(len(toks))
                 if (job.arc_at is not None and not job.arc_done
                         and job.cursor >= job.arc_at):
                     self.e.arc_put(list(job.cur), job.seq)

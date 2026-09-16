@@ -168,6 +168,31 @@ top-k 校验过。
 所以同一次读可以同时推进多个序列。`CC_BATCH=1` 时并发请求共享一次前向：解码吞吐是
 逐个服务的 3.3 倍。
 
+### 两个批大小，以及它们为什么必须分开
+
+`CC_N_BATCH` 和 `CC_N_UBATCH` 默认 2048 和 512，与 LM Studio 在同一张卡、同一个模型上
+的*评估批处理大小*和*Physical Batch Size* 一致 —— 这样两边才是可比的。此前它们被硬编码
+为 512 和 128。
+
+| | `CC_N_BATCH` (2048) | `CC_N_UBATCH` (512) |
+|---|---|---|
+| 限制什么 | 一次 `llama_decode` 的 token 数 | 一次 GPU 前向的 token 数 |
+| 提升什么 | Python 侧的调度开销 | **prefill 吞吐** |
+| 显存开销 | 几乎为零 | **线性增长** —— compute buffer 是 `n_ubatch × n_embd` |
+| 还有谁读它 | `Batch._plan` 用它算每步的 token 预算 | 没有 |
+
+两者不可互换。当 `n_batch > n_ubatch` 时，llama.cpp 会把逻辑批拆成多次前向，所以**只调大
+`n_batch` 除了减少记账开销之外没有别的收益** —— 真正决定 prefill 速度的是 `n_ubatch`。
+而它也是会把显存吃爆的那个：在 `n_ctx` 524288 配 Q4_0 KV 的情况下这是真实风险。
+`n_ubatch > n_batch` 会在启动时被拒绝，并明确报出两个设置名，而不是抛一个什么都不说的
+assert。
+
+有一处耦合被特意切开了。调度器原本把每个 prefill chunk 取作 `eng.bs // 4`，在 `n_batch`
+为 512 时是 128；但把 `n_batch` 提到 2048 会让它变成 512，而一个 prefill 从一步里拿走 512
+个 token，正是实测出 **p90 199 秒**的那种形态：一个刚到的提示词吃掉了整步，已经在解码的
+序列一个 token 都拿不到。现在 chunk 独立地封顶在 128，并可用 `CC_BATCH_CHUNK` 直接指定。
+**每步的预算**仍然随 `n_batch` 放大，那才是这个设置该管的事。
+
 **投机解码。** `CC_DDC` 复用模型已经产出过的延续，再批量验证。草稿来自上下文本身，
 唯一代价是验证；草稿落地时一轮约快 3 倍，不落地时是净亏。所以由**两道闸门**决定它
 什么时候运行。
@@ -221,6 +246,11 @@ top-k 校验过。
 | `CC_ARCHIVE_MIN` | 512 | 短于这个长度的前缀不值得归档 |
 | `CC_BATCH_N` | 4 | worker 序列数，即并发请求数 |
 | `CC_BATCH_WAIT` | 512 | 为免等最忙的 worker，愿意让出的前缀 token 数 |
+| `CC_N_BATCH` | 2048 | 逻辑批：一次 `llama_decode` 最多携带多少 token。同时也决定调度器每步的 token 预算 |
+| `CC_N_UBATCH` | 512 | 物理批：GPU 一次前向实际计算多少 token。必须 ≤ `CC_N_BATCH`。显存开销线性增长 |
+| `CC_BATCH_CHUNK` | 128 | 单个 prefill 最多能从一步里拿走多少 token。刻意不与 `CC_N_BATCH` 挂钩 |
+| `CC_PROGRESS` | 1 | 报告 prefill 进度；`0` 关闭 |
+| `CC_PROGRESS_STEP` | 10 | 两条进度日志之间的百分比间隔；`0` 同样关闭 |
 | `CC_DDC_M` | 32 | 草稿长度上限；通常先卡住的是截断阈值 |
 | `CC_DDC_T` | 0.5 | 草稿截断阈值，越低草稿越长。`M=32/T=0.5` 时每轮 15 到 22 token |
 | `CC_DDC_MAX_CTX` | 窗口长度 | 草稿缓存让开的长度；默认等于该序列自己的窗口，`0` 表示连钳制也去掉 |

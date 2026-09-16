@@ -120,6 +120,171 @@ def plan_sequences(n_ctx: int, workers: int) -> tuple[int, int, int | None]:
     return nseq, (n_ctx * nseq if nseq > 1 else n_ctx), ddc_seq
 
 
+# Prompt-processing progress reporting.
+#
+# Why this exists rather than llama.cpp's own "Prompt processing progress: N%":
+# this engine prefills in chunks of at most `bs` tokens so that a long prompt
+# shares a step with requests that are already decoding (see Batcher._plan), and
+# the C-level message is emitted per n_batch forward pass with no notion of the
+# request it belongs to.  On a 117k-token prompt -- which this server really
+# sees, the measured maximum -- that is over 900 identical lines per request,
+# several of them interleaved from concurrent jobs.  It reports the engine's
+# granularity, not the caller's question, which is "how far along is MY prompt".
+#
+# So the percentage is computed here, from numbers the engine already has, and
+# emitted only when it actually moves by PROGRESS_STEP.  `total` is the whole
+# prefill this request PAYS FOR -- the forwarded part, since the reused prefix is
+# already in the KV and costs nothing -- so the first line of a cache-served
+# request starts wherever the real work starts.
+PROGRESS_STEP = float(os.environ.get("CC_PROGRESS_STEP", "10") or 10)
+
+
+def progress_enabled() -> bool:
+    """Whether to report prefill progress.  CC_PROGRESS=0 turns it off."""
+    v = os.environ.get("CC_PROGRESS", "1").strip().lower()
+    if v in ("0", "false", "off", "no"):
+        return False
+    try:
+        return float(os.environ.get("CC_PROGRESS_STEP", "10") or 10) > 0
+    except ValueError:
+        return True
+
+
+# Batch sizes.  These were hardcoded at n_batch=512 / n_ubatch=128, which is the
+# conservative end of what llama.cpp accepts; LM Studio's defaults for the same
+# model on the same card are 2048 / 512, so the two servers were never a
+# like-for-like comparison.  They are read from the environment now so the pair
+# can be A/B'd without editing code.
+#
+# What the two do, and why they are NOT interchangeable:
+#
+#   n_batch   the LOGICAL batch: the most tokens one llama_decode may carry.
+#             Here it is also load-bearing in Python -- Batch._plan sizes each
+#             step's token budget from it, so raising it lets one step advance
+#             more sequences.  It does NOT size the prefill chunk: that was
+#             bs // 4 once, which on a fan-out is the shape that produced a
+#             measured p90 of 199 s, and it is capped at 128 independently now
+#             (see Batcher.__init__ / CC_BATCH_CHUNK).
+#             It costs almost no VRAM by itself.
+#
+#   n_ubatch  the PHYSICAL batch: what one GPU forward pass actually computes.
+#             This is the knob that moves prefill throughput, because it sets the
+#             real parallelism per pass.  When n_batch > n_ubatch, llama.cpp
+#             splits the logical batch into several forward passes, so raising
+#             n_batch alone buys nothing but shorter Python-side bookkeeping.
+#             It costs VRAM LINEARLY -- the compute buffer is n_ubatch x n_embd --
+#             which is the reason it is the one to watch for an OOM.
+#
+# n_ubatch > n_batch is rejected by llama.cpp, and n_ubatch <= 0 is clamped by
+# it, so both are validated here where the failure can name the setting.
+def n_batch_default() -> int:
+    """CC_N_BATCH, default 2048 (LM Studio's evaluation batch size)."""
+    return _int_env("CC_N_BATCH", 2048, minimum=1)
+
+
+def n_ubatch_default() -> int:
+    """CC_N_UBATCH, default 512 (LM Studio's physical batch size)."""
+    return _int_env("CC_N_UBATCH", 512, minimum=1)
+
+
+def _int_env(name: str, default: int, minimum: int = 1) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        v = int(str(raw).strip())
+    except ValueError:
+        raise ValueError(f"{name} must be an integer, got {raw!r}")
+    if v < minimum:
+        raise ValueError(f"{name} must be >= {minimum}, got {v}")
+    return v
+
+
+class Progress:
+    """Per-request prefill progress, reported in whole steps.
+
+    One instance per request, because the batched scheduler advances several
+    prefill cursors in the same step and a shared counter would credit one
+    request with its neighbours' tokens -- the same reason Job carries its own
+    pf_s/gn_s rather than reading the engine's global counters.
+
+    The percentage is of the tokens THIS request forwards, not of the prompt:
+    a request served from the cache forwards a few hundred of a 50k prompt and
+    should read as nearly done, not as 1%.
+
+    ``label`` is what makes concurrent jobs tellable apart in the log; it is the
+    sequence index the scheduler handed the job.
+    """
+
+    __slots__ = ("total", "done", "next_at", "label", "log", "on", "started")
+
+    def __init__(self, total: int, log, label=None):
+        self.total = max(0, int(total))
+        self.done = 0
+        self.label = label
+        self.log = log
+        self.on = bool(self.total) and progress_enabled() and PROGRESS_STEP > 0
+        # The threshold the NEXT line needs, as a percentage.  It is only ever
+        # compared against the live percentage: the number printed is always
+        # recomputed from self.done, so the percentage and the token counts on a
+        # line can never disagree.  (Printing the threshold itself instead was
+        # wrong the moment a chunk crossed several steps at once -- a bs-sized
+        # serial chunk emitted "10.0% (1000/1000 tok)".)
+        self.next_at = PROGRESS_STEP
+        # The 0% line is NOT emitted here.  A reporter is constructed when a job
+        # is ADMITTED, which under the batched scheduler can be well before the
+        # job is first advanced -- it may be waiting for a worker holding its
+        # history.  Printing at construction would leave a "0.0% ..." line
+        # sitting there while nothing happens, which reads like a stall.  The
+        # first line goes out on the first forward pass instead (see add), so
+        # every line corresponds to work that has actually begun.
+        self.started = False
+
+    def _say(self):
+        if self.log is None:
+            return
+        pct = 100.0 * self.done / self.total if self.total else 100.0
+        where = "" if self.label is None else f" seq={self.label}"
+        self.log(f"prefill {pct:5.1f}% ({self.done}/{self.total} tok{where})")
+
+    def add(self, n: int):
+        """Account for ``n`` forwarded tokens, emitting at most one line.
+
+        At most one, not one per step crossed: the percentage printed is always
+        the live one, so several steps crossed by the same chunk would print the
+        SAME percentage and the same token counts several times over.  A chunk is
+        one forward pass, and one line per forward pass at the reader's chosen
+        granularity is what this is for.  ``next_at`` is still advanced past
+        every threshold the chunk cleared, so the next line reports the next step
+        that has genuinely not been shown yet.
+        """
+        if not self.on:
+            return
+        self.done += n
+        pct = 100.0 * self.done / self.total
+        if not self.started:
+            # First real work: report where it starts.  This is the line that
+            # makes a cache-served prefill visible at all, since forwarding 300
+            # of 50k tokens may never reach the first whole step.
+            self.started = True
+            self._say()
+            while self.next_at < 100.0 and pct >= self.next_at:
+                self.next_at += PROGRESS_STEP
+        elif pct >= self.next_at or self.done >= self.total:
+            self._say()
+            # Advance past everything this chunk cleared.  A while loop rather
+            # than an assignment, because one chunk can clear several steps (the
+            # serial path forwards up to bs tokens per decode) and leaving
+            # next_at behind would make the next line repeat a stale threshold.
+            while self.next_at < 100.0 and pct >= self.next_at:
+                self.next_at += PROGRESS_STEP
+        if self.done >= self.total:
+            # Done: `on` is cleared so a later add() (the batched path can call
+            # this again if a re-used sequence's cursor moves past the end) stays
+            # silent instead of printing 100% a second time.
+            self.on = False
+
+
 def probe(e, pids: list[int], max_new: int, stop: list[str], stopk: tuple,
           turn=None, on_token=None, on_serve=None):
     """Try every layer that needs no KV work.  Returns gen()'s triple, or None.
@@ -200,10 +365,12 @@ def probe(e, pids: list[int], max_new: int, stop: list[str], stopk: tuple,
 
 
 class Eng:
-    def __init__(self, n_ctx: int = 131072, bs: int = 512, n_rs: int = 0,
+    def __init__(self, n_ctx: int = 131072, bs: int = None, n_rs: int = 0,
                  nseq: int = 1, workers: int = 1, log=print):
         self.log = log
         L = self.L = bind()
+        if bs is None:
+            bs = n_batch_default()
 
         # The sequence layout is settled once, here, from the caller's numbers
         # and the environment; every index below is read off it instead of being
@@ -380,7 +547,15 @@ class Eng:
         mp = L.llama_model_default_params(); mp.ngl = 999
         self.mdl = L.llama_model_load_from_file(GGUF.encode(), mp)
         cp = L.llama_context_default_params()
-        cp.n_ctx = n_ctx; cp.n_batch = bs; cp.n_ubatch = 128
+        ub = n_ubatch_default()
+        if ub > bs:
+            # llama.cpp asserts rather than recovering from this, and the abort
+            # names nothing, so it is caught here where the settings are known.
+            raise ValueError(
+                f"CC_N_UBATCH ({ub}) must not exceed the logical batch "
+                f"CC_N_BATCH ({bs}); the physical batch is a subdivision of the "
+                f"logical one, so a larger value has nothing to subdivide")
+        cp.n_ctx = n_ctx; cp.n_batch = bs; cp.n_ubatch = ub
         cp.n_seq_max = nseq; cp.n_rs_seq = n_rs
         cp.tk = Q4_0; cp.tv = Q4_0          # quantized KV; 9216 B/position x n_ctx, paid once at context creation
         self.ctx = L.llama_init_from_model(self.mdl, cp)
@@ -390,6 +565,15 @@ class Eng:
         self.nv = L.llama_vocab_n_tokens(self.vcb)
         self.kmem = L.llama_get_memory(self.ctx)   # not named mem: mem() below is the memory report and would collide
         self.bs = bs
+        # Kept so the startup line can report the pair that was actually applied
+        # rather than the defaults, which is the only way a user can tell whether
+        # their CC_N_UBATCH took effect.
+        self.ub = ub
+
+        # The prefill progress reporter in force, or None.  Only ever set around
+        # a prefill (see gen/feed_prefix): feed() is shared with the decode path,
+        # where a prompt percentage would be meaningless.
+        self.prog = None
 
         self.cur: list[int] = []                   # the token sequence the KV currently holds
         self.lgc: dict = {}                        # logits cache: key -> (toks, text, trunc, stopk)
@@ -444,7 +628,8 @@ class Eng:
         n = L.llama_model_meta_val_str(self.mdl, b"tokenizer.chat_template", tb, len(tb))
         self.tpl = tb.raw[:n].decode("utf-8") if n > 0 else None
         log(f"n_ctx={n_ctx} nv={self.nv} {time.time()-t0:.1f}s "
-            f"tpl={'yes, ' + str(len(self.tpl)) + ' chars' if self.tpl else 'none'}")
+            f"tpl={'yes, ' + str(len(self.tpl)) + ' chars' if self.tpl else 'none'} "
+            f"n_batch={bs} n_ubatch={ub}")
 
     # ---------------- basics ----------------
     def tmpl(self, msgs: list, add_ass: bool = True) -> str:
@@ -482,6 +667,13 @@ class Eng:
         L = self.L
         chunk = chunk or self.bs
         raw = bytes((ct.c_int32 * len(ids))(*ids))
+        # Prefill progress, when a prefill established one (see Progress).  The
+        # hook lives here rather than in the callers because this loop is the
+        # only place that knows a chunk has actually been forwarded -- reporting
+        # on entry would claim progress before the work it describes.  During
+        # generation `prog` is None and nothing is emitted: a decode step is one
+        # token, and a percentage of a prompt says nothing about it.
+        prog = self.prog
         i = 0
         while i < len(ids):
             m = min(chunk, len(ids) - i)
@@ -489,6 +681,8 @@ class Eng:
             if L.llama_decode(self.ctx, L.llama_batch_get_one(sub, m)) != 0:
                 raise RuntimeError(f"decode failed at {i}/{len(ids)}")
             i += m
+            if prog is not None:
+                prog.add(m)
         self.cur.extend(ids)
 
     def kvlen(self) -> int:
@@ -775,7 +969,11 @@ class Eng:
         if p > 0:
             st["apc"] += 1
         if new:
-            self.feed(new)
+            self.prog = Progress(len(new), getattr(self, "log", None))
+            try:
+                self.feed(new)
+            finally:
+                self.prog = None
 
         seq = list(pids)                     # the full sequence = prompt + generated
         self.ng = {}; self.ng_done = 0
@@ -1094,7 +1292,11 @@ class Eng:
             st["apc"] += 1
         t0 = time.time()
         if new:
-            self.feed(new)
+            self.prog = Progress(len(new), getattr(self, "log", None))
+            try:
+                self.feed(new)
+            finally:
+                self.prog = None
         st["t_pre"] += time.time() - t0
 
         # Build the n-gram index; seq is the running full token sequence.
@@ -1526,7 +1728,16 @@ class Eng:
         if p > 0:
             st["apc"] += 1
         t0 = time.time()
-        self.feed_prefix(pids, p, p_raw, arc)
+        # Prefill progress for this request alone.  The total is what this
+        # request forwards, not the prompt: the reused prefix is already in the
+        # KV, so a cache hit that forwards 300 of 50k tokens is nearly done at
+        # its first line rather than 1% through work it is not doing.
+        self.prog = (Progress(len(new), getattr(self, "log", None))
+                     if new else None)
+        try:
+            self.feed_prefix(pids, p, p_raw, arc)
+        finally:
+            self.prog = None
         st["t_pre"] += time.time() - t0
 
         # 3) Token-by-token generation.  A stop string has to be judged BEFORE it
@@ -1662,7 +1873,12 @@ class Eng:
             # zero, which is what the hit-rate tooling reads off the transcript.
             on_serve(p, "ddc")
         t0 = time.time()
-        self.feed_prefix(pids, p, p_raw, arc)
+        self.prog = (Progress(len(pids) - p, getattr(self, "log", None))
+                     if p < len(pids) else None)
+        try:
+            self.feed_prefix(pids, p, p_raw, arc)
+        finally:
+            self.prog = None
         pre_s = time.time() - t0
         toks, text, ds = _ddc_gen(self, list(pids), max_new,
                                   cache=self.ddc, stop=tuple(stop),
