@@ -164,6 +164,13 @@ top-k 校验过。
 状态，后来有请求要时整块恢复。上面那次会话里它服务了 20 个请求中的 7 个；最清楚的
 一个是 24,775 token 的提示词只转发了 **2,324** 个，另外 22,451 个已经在归档状态里。
 
+归档槽位按 `CC_ARCHIVE_CAP` 计费，默认半个窗口，而不是一整个：槽位里存的是别人已经
+prefill 过的状态，值得留的都是分叉点，本来就短 —— 实测十个兄弟 agent 真正共享的前缀
+是 16,406 token，归档过的边界在 16k–42k，对着 131072 的窗口按整窗计费是白花的。
+省下来的正是槽位本身：`CC_ARCHIVE_SLOTS=2` 现在花的是过去一个槽位的显存。代价是超出
+cap 的长边界不再归档（计入 `arc_skip_cap`），那些请求改为重新 prefill —— 丢的是复用，
+不是正确性。`CC_ARCHIVE_CAP=0` 回到整窗计费的老布局。
+
 **批处理服务。** 一次 9B Q4 解码步不管产出多少 token 都要把 5.5 GB 权重整个读一遍，
 所以同一次读可以同时推进多个序列。`CC_BATCH=1` 时并发请求共享一次前向：解码吞吐是
 逐个服务的 3.3 倍。
@@ -243,6 +250,8 @@ assert。
 | 变量 | 默认 | 作用 |
 |---|---|---|
 | `CC_ARCHIVE_SLOTS` | 1 | archive 保留几个序列 |
+| `CC_ARCHIVE_CAP` | 窗口/2 | 单个 archive 槽位最多算多少 token 的 KV。`0` 表示按整个窗口计费，即统一 KV 池之前的布局。每多开一个槽位就正好多花这么多 |
+| `CC_ARCHIVE_CAP_DIV` | 2 | 上面那个默认值的除数，在 `CC_ARCHIVE_CAP` 未设置时生效 |
 | `CC_ARCHIVE_MIN` | 512 | 短于这个长度的前缀不值得归档 |
 | `CC_BATCH_N` | 4 | worker 序列数，即并发请求数 |
 | `CC_BATCH_WAIT` | 512 | 为免等最忙的 worker，愿意让出的前缀 token 数 |
@@ -276,8 +285,11 @@ $env:CC_BATCH='1'; $env:CC_BATCH_N='3'
 python run.py --port 8788 --n-ctx 131072
 ```
 
-`n_ctx` 会乘以序列数，好让每个序列保住完整窗口：3 个 worker 加 1 个 archive 槽就是
-`n_ctx` × 4，131072 时约 4.8 GB KV。卡紧张就把 `--n-ctx` 调小。
+`n_ctx` 是 **KV 池**，不是单个请求能发多长。池按「干活的序列各留一整窗、archive 槽按
+`CC_ARCHIVE_CAP`（默认半窗）计费」来定：3 个 worker 加 1 个 archive 槽是
+`131072` × 3 + `65536`，约 4.2 GB KV，而不是 4.8。再开一个 archive 槽只多花一个 cap，
+所以 `CC_ARCHIVE_SLOTS=2` 正好是过去单个整窗槽位的显存。`CC_ARCHIVE_CAP=0` 精确还原
+老布局。卡紧张就把 `--n-ctx` 调小。
 
 ### 什么时候该关掉某一层
 
@@ -296,8 +308,9 @@ python run.py --port 8788 --n-ctx 131072
   闸门在别处会关掉它，所以关掉它的常见理由不是速度，而是**确定性**。一轮投机走的是
   不同的数值路径，需要回复与纯单 token 服务端逐位一致就设 `CC_DDC=0`。
 - **前缀 archive 默认开，`CC_DDC` 默认关**，和以前正好相反。打开 DDC 要在 archive
-  的槽之外再占一个序列 —— archive 留自己的槽，DDC 留自己的验证 scratch，合计 `n_ctx`
-  乘以 worker 数 + 1 + archive 槽数。这两个设置谁也不会关掉谁。
+  的槽之外再占一个序列 —— archive 留自己的槽，DDC 留自己的验证 scratch，各自从池里
+  按自己的份额计费（scratch 一整窗，archive 槽各一个 `CC_ARCHIVE_CAP`）。这两个设置
+  谁也不会关掉谁。
 
 ---
 

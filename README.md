@@ -323,7 +323,8 @@ Two things are worth knowing before turning it on:
   and the archive keeps its own, so the layouts are disjoint and
   `CC_ARCHIVE=1 CC_DDC=4` — or just `CC_DDC=4`, since the archive is on anyway —
   is served. It costs one sequence on top of the archive's, and with both on,
-  `n_ctx` is multiplied by workers + 1 + archive slots. A request prefills
+  `n_ctx` is charged a full window for the workers and DDC's scratch plus
+  `CC_ARCHIVE_CAP` for each archive slot. A request prefills
   through the archive first and the draft cache then runs on top of whatever
   prefix that restored; that same prefill is what fills the archive.
 - **The batched scheduler**, via `CC_DDC_BATCH=1`. Without it DDC runs on the
@@ -359,7 +360,7 @@ Everything is an environment variable.
 
 | variable | default | effect |
 |---|---|---|
-| `CC_ARCHIVE` | on | prefix archive. Costs a spare sequence, so `n_ctx` doubles and KV goes 1.2 to 2.4 GB at 131072. Set `CC_ARCHIVE=0` to turn it off |
+| `CC_ARCHIVE` | on | prefix archive. Costs a spare sequence, charged `CC_ARCHIVE_CAP` (window/2) rather than a whole window. Set `CC_ARCHIVE=0` to turn it off |
 
 **Opt-in:**
 
@@ -375,6 +376,8 @@ Everything is an environment variable.
 | variable | default | effect |
 |---|---|---|
 | `CC_ARCHIVE_SLOTS` | 1 | sequences the archive keeps |
+| `CC_ARCHIVE_CAP` | window/2 | most tokens ONE archive slot is charged. `0` charges a whole window, which is the layout before the unified pool. Each extra slot costs exactly this much |
+| `CC_ARCHIVE_CAP_DIV` | 2 | the divisor behind that default, for when `CC_ARCHIVE_CAP` is unset |
 | `CC_ARCHIVE_MIN` | 512 | shortest prefix worth archiving |
 | `CC_BATCH_N` | 4 | worker sequences, i.e. concurrent requests |
 | `CC_BATCH_WAIT` | 512 | prefix tokens worth giving up to avoid waiting for the busiest worker |
@@ -411,9 +414,13 @@ $env:CC_BATCH='1'; $env:CC_BATCH_N='3'
 python run.py --port 8788 --n-ctx 131072
 ```
 
-`n_ctx` is multiplied by the sequence count so each keeps a full window: 3
-workers plus 1 archive slot is `n_ctx` x 4, or 4.8 GB of KV at 131072. Lower
-`--n-ctx` if the card is tight.
+`n_ctx` is the KV POOL, not what one request may send. It is sized so each
+sequence that works keeps a full window, while the archive slots are charged
+`CC_ARCHIVE_CAP` (half a window by default): 3 workers plus 1 archive slot is
+`131072` x 3 + `65536`, or 4.2 GB of KV instead of 4.8. Each further archive
+slot costs one cap, so `CC_ARCHIVE_SLOTS=2` fits the same 4.8 GB the single
+full-window slot used to. `CC_ARCHIVE_CAP=0` restores that layout exactly.
+Lower `--n-ctx` if the card is tight.
 
 ### When to leave a layer off
 
@@ -441,7 +448,8 @@ workers plus 1 archive slot is `n_ctx` x 4, or 4.8 GB of KV at 131072. Lower
 - **The prefix archive** is on by default and `CC_DDC` is off by default, which
   is the opposite of how they used to be. Turning DDC on costs a sequence on top
   of the archive's — the archive keeps its slots, DDC keeps its verification
-  scratch, and `n_ctx` is multiplied by workers + 1 + archive slots. Neither
+  scratch, and each of those is charged its own share of the pool (a full window
+  for the scratch, `CC_ARCHIVE_CAP` per archive slot). Neither
   setting disables the other.
 
 ---

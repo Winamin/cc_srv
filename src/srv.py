@@ -28,7 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from batch import Batcher, run_job
-from eng import Eng, arc_slot_count, ddc_scratch_count, plan_sequences
+from eng import Eng, arc_slot_count, ddc_scratch_count, plan_sequences, pool_terms
 from log import C, log, setup as log_setup
 from qcache import turn_key
 from stream import Streamer
@@ -989,17 +989,18 @@ def main():
     # archive had already claimed.
     nseq, n_ctx, ddc_seq = plan_sequences(a.n_ctx, workers)
     if nseq > 1:
-        # n_ctx is multiplied so every sequence keeps the full window: the cells
-        # are n_ctx in total and llama.cpp divides them across the sequences,
-        # which is what makes this cost memory rather than nothing.  Every term
-        # is read off the plan rather than assumed -- this line is how the
-        # layout gets checked at startup, so a hardcoded count here would be a
-        # wrong answer to the question it exists to answer.
+        # n_ctx is the POOL: the cells are n_ctx in total and llama.cpp divides
+        # them across the sequences, which is what makes this cost memory rather
+        # than nothing.  How it is derived -- flat multiplication, or workers at
+        # full window plus archive slots at CC_ARCHIVE_CAP -- is pool_for's
+        # business, and pool_terms renders that same function for this line
+        # rather than paraphrasing it, so the log cannot describe a layout the
+        # arithmetic did not produce.
         scratch_n = ddc_scratch_count(workers)
         logit(f"nseq {nseq} = {workers} worker(s) + "
               f"{f'{scratch_n} DDC scratch + ' if scratch_n else ''}"
               f"{arc_slot_count()} archive slot(s), "
-              f"n_ctx {a.n_ctx} -> {n_ctx} (KV reservation x{nseq})")
+              f"n_ctx {a.n_ctx} -> {n_ctx} (pool: {pool_terms(a.n_ctx, workers)})")
     log_setup(LOGDIR)
     log_setup(LOGDIR)
     logit(f"loading engine n_ctx={n_ctx} nseq={nseq}")

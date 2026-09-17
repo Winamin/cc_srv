@@ -68,10 +68,15 @@ Prefix archive (on by default; CC_ARCHIVE=0 turns it off.  See USAGE.md 6.4):
                     long prefix but are not extensions of each other, so without
                     it every sibling rebuilds its whole context.  Measured at 65x
                     less prefill on siblings, with an identical reply.  It needs
-                    a spare sequence, so n_ctx doubles (KV 1.2 GB -> 2.4 GB at
-                    131072) -- that is the cost.
+                    a spare sequence, charged CC_ARCHIVE_CAP tokens of KV rather
+                    than a whole window -- half a window by default, so the slot
+                    costs 0.6 GB at 131072 instead of 1.2.  What it costs is the
+                    boundaries past that cap, which are not archived at all and
+                    are counted in arc_skip_cap.
     CC_ARCHIVE=0    turn it off, back to a plain single-sequence server
     CC_ARCHIVE_MIN=512  shortest prefix worth archiving
+    CC_ARCHIVE_CAP=N    most tokens one archive slot is charged.  0 charges a
+                    whole window, which is the layout before the unified pool
 
 Speculation gate (see spec.py): a speculative round costs a verification pass
 over the whole draft plus, unless it is accepted in full, a second pass to

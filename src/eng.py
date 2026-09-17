@@ -50,6 +50,15 @@ def ddc_key():
     return v if (v and v != "0") else None
 
 
+# How much of a worker's window one archive slot is charged by default.  The
+# slot holds a state some request already prefilled, and the ones worth keeping
+# are divergence points, which are short -- see arc_cap_for.  Halving it is the
+# value that buys a second archive point for the VRAM the slot used to cost on
+# its own, which is the trade the archive was asked for; CC_ARCHIVE_CAP=0
+# restores the old full-window slot outright.
+ARC_CAP_DIV = max(1, int(os.environ.get("CC_ARCHIVE_CAP_DIV", "2") or 2))
+
+
 def arc_slot_count() -> int:
     """How many sequences the prefix archive asks to keep.  0 when it is off.
 
@@ -59,6 +68,52 @@ def arc_slot_count() -> int:
     if v in ("0", "false", "off", "no"):
         return 0
     return int(os.environ.get("CC_ARCHIVE_SLOTS", "1"))
+
+
+def arc_cap_for(window: int) -> int:
+    """The most tokens ONE archive slot may hold, given the worker window.
+
+    CC_ARCHIVE_CAP sets it outright; 0 there means NO cap, which charges an
+    archive slot a whole window exactly as the layout always did.  Unset, it
+    defaults to half the window -- see ARC_CAP_DIV.
+
+    Why an archive slot is worth charging less than a worker: the two hold
+    different things.  A worker sequence has to hold whatever prompt arrives and
+    is bounded by the window; an archive slot only ever holds a state that some
+    request already prefilled, and the states worth keeping are the DIVERGENCE
+    points, which are short.  Measured on the fan-out recordings, the prefix ten
+    sibling agents actually shared was 16406 tokens against a 131072 window, and
+    the archived boundaries ran 16k-42k.  Charging every slot a full window for
+    that is what kept CC_ARCHIVE_SLOTS at 1.
+
+    What the cap costs is the long boundaries: a state past it is not archived
+    at all (arc_ready declines it and arc_skip_cap counts it), so a request that
+    would have restored it prefills instead.  That is a reuse loss, never a
+    correctness loss -- nothing is truncated, the state simply is not kept.
+
+    Honoured only while CC_KV_UNIFIED is on -- without a unified pool llama.cpp
+    splits the cells evenly and a per-sequence cap is not expressible at all.
+    See arc_capped.
+    """
+    raw = os.environ.get("CC_ARCHIVE_CAP")
+    if raw is None or not str(raw).strip():
+        return max(1, max(1, window) // ARC_CAP_DIV)
+    return _int_env("CC_ARCHIVE_CAP", 0, minimum=0)
+
+
+def arc_capped(window: int) -> bool:
+    """Whether archive slots are charged a capped budget instead of a window.
+
+    Three things have to hold.  Without CC_KV_UNIFIED the cells are split evenly,
+    so every sequence gets pool/nseq whether it uses it or not and a cap is not
+    expressible.  With no archive slots there is nothing to cap.  And a cap at or
+    above the window is the historical layout by another name, so it is reported
+    as uncapped rather than as a cap that happens to save nothing.
+    """
+    if not kv_unified_default() or not arc_slot_count():
+        return False
+    cap = arc_cap_for(window)
+    return 0 < cap < max(1, window)
 
 
 def ddc_batch_pool() -> int:
@@ -88,6 +143,77 @@ def ddc_scratch_count(workers: int) -> int:
     return ddc_batch_pool()
 
 
+def pool_for(window: int, workers: int) -> int:
+    """The KV cells to reserve so ``workers`` sequences each keep ``window``.
+
+    One place decides this.  srv.py calls it (through plan_sequences) before the
+    context exists and Eng calls it again while constructing, and Eng recovers
+    the window from the pool with window_of, its exact inverse -- so a change
+    here cannot leave the two disagreeing about how large a request may be.
+
+    Uncapped this is the flat ``window x nseq`` it has always been: every
+    sequence, archive slots included, is charged the full window.  Capped it is
+
+        window x (workers + DDC scratch) + cap x archive slots
+
+    so the sequences that WORK keep the caller's whole window, while the ones
+    that only HOLD state are charged what they are allowed to hold.  Both terms
+    are in cells, and the unified pool is what lets them be added: llama.cpp
+    splits n_ctx evenly across n_seq_max unless kv_unified is set, and an uneven
+    split is exactly what this is.
+    """
+    work = max(1, workers + ddc_scratch_count(workers))
+    arc = arc_slot_count()
+    if arc_capped(window):
+        return max(1, window) * work + arc_cap_for(window) * arc
+    return max(1, window) * max(1, work + arc)
+
+
+def window_of(pool: int, workers: int) -> int:
+    """How many tokens ONE sequence may hold, given a pool from pool_for.
+
+    The exact inverse of pool_for, found by search rather than by rearranging it:
+    pool_for is monotone in the window, so the largest window it still fits in
+    ``pool`` IS the window that produced ``pool``.  Rearranging would be another
+    definition of the sizing to keep in step, and keeping two definitions in step
+    is the failure this whole block exists to avoid -- it is how DDC's scratch
+    once landed on the sequence the archive had already claimed.
+
+    This used to be the literal ``n_ctx // nseq`` at the point of use, which is
+    only right while the pool is nseq equal slices.  Capped it is not, and
+    dividing anyway UNDER-reports what a worker sequence can hold -- so requests
+    that fit get rejected, and the archive is blamed for a limit it did not
+    impose.
+
+    Values below pool_for(1, workers) -- a caller that passed a pool too small
+    for even two sequences -- come back as 1, which is the honest answer and
+    leaves the admission check to refuse the request.
+    """
+    lo, hi = 1, max(1, pool)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if pool_for(mid, workers) <= pool:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+def pool_terms(window: int, workers: int) -> str:
+    """pool_for in words, for the startup line.
+
+    Kept beside it so the log and the arithmetic cannot describe two different
+    layouts -- the startup line is how the layout gets checked, and a hardcoded
+    description there would be a wrong answer to the question it exists to
+    answer.
+    """
+    work = max(1, workers + ddc_scratch_count(workers))
+    arc = arc_slot_count()
+    if arc_capped(window):
+        return f"window {window} x {work} + cap {arc_cap_for(window)} x {arc}"
+    return f"window {window} x {work + arc}"
+
+
 def plan_sequences(n_ctx: int, workers: int) -> tuple[int, int, int | None]:
     """Decide the sequence budget, and with it the KV reservation.
 
@@ -106,18 +232,22 @@ def plan_sequences(n_ctx: int, workers: int) -> tuple[int, int, int | None]:
 
     srv.py calls this before the context exists and Eng calls it again while
     constructing; its outputs are pure functions of (workers, environment) -- the
-    n_ctx argument only scales the returned reservation -- so the two calls
-    cannot drift.  They used to be sized separately -- srv.py owned the archive,
-    Eng owned DDC's doubling -- which is exactly how DDC's scratch ended up on
-    the sequence the archive had already claimed.
+    n_ctx argument is the per-request WINDOW, and only scales the returned
+    reservation -- so the two calls cannot drift.  They used to be sized
+    separately -- srv.py owned the archive, Eng owned DDC's doubling -- which is
+    exactly how DDC's scratch ended up on the sequence the archive had already
+    claimed.
 
-    n_ctx is multiplied so that every sequence keeps the caller's full window:
-    llama.cpp divides its cells across n_seq_max, so this is the whole reason the
-    combination costs memory rather than nothing.
+    The second element is pool_for(n_ctx, workers), and it exceeds n_ctx because
+    llama.cpp divides its cells across n_seq_max: that multiplication is the
+    whole reason the combination costs memory rather than nothing.  The sizing
+    itself lives in pool_for rather than on the line below so that the capped
+    case -- where it is not a flat multiplication -- stays one definition.
     """
-    nseq = max(1, workers + ddc_scratch_count(workers) + arc_slot_count())
-    ddc_seq = workers if ddc_scratch_count(workers) else None
-    return nseq, (n_ctx * nseq if nseq > 1 else n_ctx), ddc_seq
+    scratch = ddc_scratch_count(workers)
+    nseq = max(1, workers + scratch + arc_slot_count())
+    ddc_seq = workers if scratch else None
+    return nseq, pool_for(n_ctx, workers), ddc_seq
 
 
 # Prompt-processing progress reporting.
@@ -185,6 +315,34 @@ def n_batch_default() -> int:
 def n_ubatch_default() -> int:
     """CC_N_UBATCH, default 512 (LM Studio's physical batch size)."""
     return _int_env("CC_N_UBATCH", 512, minimum=1)
+
+
+def kv_unified_default() -> bool:
+    """CC_KV_UNIFIED, default on.  One KV pool shared by every sequence.
+
+    Off (llama.cpp's own default), the n_ctx cells are split evenly across
+    n_seq_max: each sequence owns a fixed slice and cannot borrow from another,
+    so a spare sequence costs a full slice whether or not it uses it.  That is
+    why this engine multiplies n_ctx by the sequence count -- it is buying a
+    full window for every sequence, archive slots included.
+
+    On, the sequences draw from one pool.  Measured on this model with
+    n_ctx=4096, n_seq_max=4: a single sequence could hold all 3000 tokens fed to
+    it with kv_unified on, and only 1024 with it off.
+
+    That changes what a spare sequence costs.  An archive slot that holds 21k
+    tokens of state no longer reserves a whole window to do it, so the number of
+    archive slots stops being bounded by VRAM the way it was.
+
+    It also changes what n_ctx means: it is the pool, not pool/nseq.  The pool is
+    sized by pool_for and the per-sequence bound is recovered from it by
+    window_of, its inverse -- dividing the pool by nseq is only right while every
+    sequence is charged the same, and with the archive capped (CC_ARCHIVE_CAP,
+    on by default) they are not.  Setting CC_ARCHIVE_CAP=0 restores the flat
+    ``window x nseq`` exactly, so the two can be compared without editing code.
+    """
+    v = os.environ.get("CC_KV_UNIFIED", "1").strip().lower()
+    return v not in ("0", "false", "off", "no")
 
 
 def _int_env(name: str, default: int, minimum: int = 1) -> int:
@@ -379,12 +537,30 @@ class Eng:
         plan_nseq, _, self.ddc_seq = plan_sequences(n_ctx, workers)
         if nseq < plan_nseq:
             # A direct caller (this module's own smoke test, a benchmark harness)
-            # asked for fewer sequences than the configuration needs.  The window
-            # it asked for is n_ctx // nseq, and every sequence keeps it: that
+            # asked for fewer sequences than the configuration needs.  It sized
+            # n_ctx for the sequences IT named, so the window it asked for is
+            # n_ctx // nseq, and the planned layout is charged that window: the
             # reservation is the price of the layout, and paying it beats the old
             # behaviour of quietly halving every sequence's window instead.
-            n_ctx = max(1, n_ctx // max(1, nseq)) * plan_nseq
+            n_ctx = pool_for(max(1, n_ctx // max(1, nseq)), workers)
             nseq = plan_nseq
+
+        # The KV cells are n_ctx in total and llama.cpp divides them across
+        # n_seq_max sequences, so this is how many tokens ONE sequence can hold.
+        # Past it llama_decode fails, and a failed decode leaves the sequences in
+        # that batch holding tokens the ledger does not know about, so the next
+        # admission computes its reusable prefix from stale data and decodes from
+        # the wrong position.  Everything that has to stay inside the window
+        # reads it from here rather than recomputing the division.
+        #
+        # Settled here, immediately after n_ctx and nseq are, because everything
+        # below -- DDC's own context limit, the archive's slot budget, the log
+        # lines -- is defined in terms of it.  It reads window_of rather than
+        # n_ctx // nseq: under a capped archive the pool is not nseq equal
+        # slices, and the division would under-report what a WORKER sequence can
+        # hold.  The two agree exactly whenever no cap is set.
+        self.window = window_of(n_ctx, workers)
+
         # The sequences DDC may verify on.  On the serial path this is the single
         # scratch ddc_decode copies into (and ddc_seq is its index); under
         # CC_DDC_BATCH the scheduler claims one per speculative round from the
@@ -465,7 +641,10 @@ class Eng:
             # length, but it is second-order: ~129 MB at 14k tokens, so ~1.3 ms a
             # copy at 64k against ~15 ms for a decoded token.
             _mctx = os.environ.get("CC_DDC_MAX_CTX")
-            self.ddc_max_ctx = (n_ctx // nseq) if _mctx is None else int(_mctx)
+            # self.window, not n_ctx // nseq: the two are the same number only
+            # while every sequence is charged a full window, and DDC's limit has
+            # to be the length a sequence can actually hold either way.
+            self.ddc_max_ctx = self.window if _mctx is None else int(_mctx)
             if self.ddc_max_ctx < 0:
                 raise ValueError("CC_DDC_MAX_CTX must be >= 0 (0 means unlimited)")
             log(f"DDC on k={_k} M={self.ddc.max_draft} "
@@ -508,6 +687,12 @@ class Eng:
         self.arc = None
         self.arc_slots: list = []
         self.arc_min = int(os.environ.get("CC_ARCHIVE_MIN", "512"))
+        # The longest state an archive slot may hold, in tokens; 0 means the slot
+        # is charged a whole window and anything that fits the window fits it.
+        # Derived from self.window, which is settled above, and read once here so
+        # arc_ready and arc_put cannot disagree about the bound while a request
+        # is in flight.
+        self.arc_cap = arc_cap_for(self.window)
         # Which sequences a batched scheduler may use for work: the first
         # ``workers`` of them and no others.  Derived here rather than left as
         # range(nseq), because under the current layout nseq counts the archive
@@ -528,20 +713,13 @@ class Eng:
             self.arc_slots = list(range(nseq - want, nseq))
             log(f"prefix archive on, slots {self.arc_slots}, "
                 f"worker sequences {self.work_seqs}, "
-                f"min prefix {self.arc_min} tokens (nseq={nseq}, n_ctx={n_ctx})")
+                f"min prefix {self.arc_min} tokens"
+                f"{f', cap {self.arc_cap}' if self.arc_cap else ''} "
+                f"(nseq={nseq}, n_ctx={n_ctx}, window={self.window})")
         if self.ddc is not None and self.ddc_seq is not None:
             log(f"DDC verification scratch {self.ddc_pool}, "
                 f"archive slots {self.arc_slots or 'none'} "
                 f"(disjoint; nseq={nseq})")
-
-        # The KV cells are n_ctx in total and llama.cpp divides them across
-        # n_seq_max sequences, so this is how many tokens ONE sequence can hold.
-        # Past it llama_decode fails, and a failed decode leaves the sequences in
-        # that batch holding tokens the ledger does not know about, so the next
-        # admission computes its reusable prefix from stale data and decodes from
-        # the wrong position.  Everything that has to stay inside the window
-        # reads it from here rather than recomputing the division.
-        self.window = n_ctx // nseq
 
         t0 = time.time()
         mp = L.llama_model_default_params(); mp.ngl = 999
@@ -557,6 +735,9 @@ class Eng:
                 f"logical one, so a larger value has nothing to subdivide")
         cp.n_ctx = n_ctx; cp.n_batch = bs; cp.n_ubatch = ub
         cp.n_seq_max = nseq; cp.n_rs_seq = n_rs
+        # One KV pool for every sequence instead of a fixed slice each.  What
+        # that buys, and why it matters for the archive, is on kv_unified_default.
+        cp.kvu = kv_unified_default()
         cp.tk = Q4_0; cp.tv = Q4_0          # quantized KV; 9216 B/position x n_ctx, paid once at context creation
         self.ctx = L.llama_init_from_model(self.mdl, cp)
         if not self.ctx:
@@ -569,6 +750,7 @@ class Eng:
         # rather than the defaults, which is the only way a user can tell whether
         # their CC_N_UBATCH took effect.
         self.ub = ub
+        self.kvu = bool(cp.kvu)
 
         # The prefill progress reporter in force, or None.  Only ever set around
         # a prefill (see gen/feed_prefix): feed() is shared with the decode path,
@@ -621,6 +803,11 @@ class Eng:
                    "ddc_gated": 0, "ddc_stood_down": 0, "ddc_feature_s": 0.0,
                    "qhit": 0, "qsaved": 0, "qedit": 0, "qtopk_s": 0.0, "qstore": 0,
                    "arc_put": 0, "arc_hit": 0, "arc_restore": 0,
+                   # Boundaries the cap refused to archive.  Counted because it
+                   # is the one way CC_ARCHIVE_CAP costs reuse, and a cap that is
+                   # biting otherwise looks the same as an archive with nothing
+                   # worth keeping -- see arc_ready.
+                   "arc_skip_cap": 0,
                    "arc_s": 0.0, "arc_tok": 0}
 
         self._turn_mark = self.tok("<|im_start|>user")
@@ -629,7 +816,7 @@ class Eng:
         self.tpl = tb.raw[:n].decode("utf-8") if n > 0 else None
         log(f"n_ctx={n_ctx} nv={self.nv} {time.time()-t0:.1f}s "
             f"tpl={'yes, ' + str(len(self.tpl)) + ' chars' if self.tpl else 'none'} "
-            f"n_batch={bs} n_ubatch={ub}")
+            f"n_batch={bs} n_ubatch={ub} kv_unified={self.kvu}")
 
     # ---------------- basics ----------------
     def tmpl(self, msgs: list, add_ass: bool = True) -> str:
@@ -1128,7 +1315,25 @@ class Eng:
     # measured to work here; no partial operation is involved.
     def arc_ready(self, upto: int) -> bool:
         """Whether the boundary at ``upto`` is worth archiving."""
-        return self.arc is not None and upto >= self.arc_min
+        if self.arc is None or upto < self.arc_min:
+            return False
+        # A state longer than the slot's budget must not be copied into it: with
+        # a capped archive the slot's cells are only CC_ARCHIVE_CAP long, and a
+        # whole-state seq_cp of something longer would take cells the pool has
+        # promised to a worker -- exactly the overrun the unified-pool sizing
+        # exists to prevent, and llama.cpp aborts the decode rather than
+        # recovering from it.
+        #
+        # Counted, not just declined.  This is the one way the cap can cost
+        # reuse, so leaving it silent would make a cap that is biting look
+        # exactly like an archive with nothing worth keeping -- and the two call
+        # for opposite fixes.  A rising arc_skip_cap against a low arc_put means
+        # raise CC_ARCHIVE_CAP; arc_put high with reuse low means the archive's
+        # matching, not its size, is the problem.
+        if 0 < self.arc_cap < upto:
+            self.st["arc_skip_cap"] = self.st.get("arc_skip_cap", 0) + 1
+            return False
+        return True
 
     def arc_put(self, tokens, src: int = 0) -> None:
         """Store sequence ``src``'s KV, which holds exactly ``tokens``, in a spare slot.
@@ -1143,6 +1348,20 @@ class Eng:
         only thing a later request can be matched against.
         """
         if not self.arc_slots:
+            return
+        if 0 < self.arc_cap < len(tokens):
+            # arc_ready cleared this boundary, but the state that exists to store
+            # is the one the sequence holds NOW, and a chunk that straddled the
+            # boundary left it up to a batch past it.  That state cannot be
+            # shortened to fit -- the copy is whole-sequence and a partial
+            # operation is the truncation that does not work on this memory -- so
+            # the boundary is dropped rather than the slot overrunning its
+            # budget and taking cells the pool promised to a worker.
+            #
+            # Counted here as well as in arc_ready so the drop is never silent:
+            # a missed hit costs one prefill, but an unexplained one costs the
+            # next hour.
+            self.st["arc_skip_cap"] = self.st.get("arc_skip_cap", 0) + 1
             return
         free = [s for s in self.arc_slots if s not in self.arc]
         if free:
@@ -1944,6 +2163,8 @@ class Eng:
             out += (f" | arc_put={s['arc_put']} arc_hit={s['arc_hit']} "
                     f"arc_restore={s['arc_restore']} "
                     f"arc_s={s['arc_s']:.2f}s/{s['arc_tok']}tok "
+                    f"cap={self.arc_cap or 'none'} "
+                    f"skip_cap={s.get('arc_skip_cap', 0)} "
                     f"slots={len(self.arc)}")
         if self.qc is not None:
             out += (f" | qhit={s['qhit']} qsaved={s['qsaved']} qedit={s['qedit']} "
