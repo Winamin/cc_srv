@@ -31,6 +31,8 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import numpy as np
 
 import spec
+import utext
+from chat_template import ChatTemplate, template_mode
 from lib import Mp, Cp, Msg, Batch, GGUF, Q4_0, bind
 
 
@@ -317,6 +319,31 @@ def n_ubatch_default() -> int:
     return _int_env("CC_N_UBATCH", 512, minimum=1)
 
 
+def n_rs_seq_default() -> int:
+    """CC_N_RS_SEQ, default 0.  Recurrent-state snapshots per sequence.
+
+    llama.h calls it "number of recurrent-state snapshots per seq for rollback
+    (0 = no rollback) [EXPERIMENTAL]", and it is the library-level half of what
+    LM Studio's load panel lists as Context Checkpoints (32 there).  The other
+    half, --ctx-checkpoints, is llama-server SLOT machinery -- there is no field
+    for it in llama_context_params, so a caller that binds llama.dll directly
+    cannot reach it at all; cc_srv's equivalent is the prefix archive.
+
+    Snapshots should matter more on this model than on a dense one: 25 of its 33
+    blocks are SSM/Mamba, and a recurrent state is a running summary that cannot
+    be rewound.  That is why a partial llama_memory_seq_rm is a no-op here and
+    why truncation rebuilds instead of trimming.  Snapshots are precisely what
+    would make a rewind expressible.
+
+    Default 0 because it does not appear to be reachable from outside
+    speculative decoding in this build: measured at 0/1/2/4 with a small
+    context, a partial seq_rm returned false and the sequence length did not
+    move either way.  Turning it on costs memory per sequence per snapshot, so
+    it stays off until something shows it doing work.
+    """
+    return _int_env("CC_N_RS_SEQ", 0, minimum=0)
+
+
 def kv_unified_default() -> bool:
     """CC_KV_UNIFIED, default on.  One KV pool shared by every sequence.
 
@@ -478,7 +505,7 @@ def probe(e, pids: list[int], max_new: int, stop: list[str], stopk: tuple,
             st["lgc"] += 1
             if trunc and len(toks_) > max_new:
                 toks = toks_[:max_new]
-                text = "".join(e.piece(t) for t in toks)
+                text = e.text_of(toks)
             else:
                 toks, text = toks_, text_
             if on_serve:
@@ -523,12 +550,16 @@ def probe(e, pids: list[int], max_new: int, stop: list[str], stopk: tuple,
 
 
 class Eng:
-    def __init__(self, n_ctx: int = 131072, bs: int = None, n_rs: int = 0,
+    def __init__(self, n_ctx: int = 131072, bs: int = None, n_rs: int = None,
                  nseq: int = 1, workers: int = 1, log=print):
         self.log = log
         L = self.L = bind()
         if bs is None:
             bs = n_batch_default()
+        # None means "take the environment's answer", the same convention bs
+        # uses above; an explicit 0 still means 0 rather than falling through.
+        if n_rs is None:
+            n_rs = n_rs_seq_default()
 
         # The sequence layout is settled once, here, from the caller's numbers
         # and the environment; every index below is read off it instead of being
@@ -811,16 +842,120 @@ class Eng:
                    "arc_s": 0.0, "arc_tok": 0}
 
         self._turn_mark = self.tok("<|im_start|>user")
+        # What must precede a REAL turn marker.  Derived, not hardcoded: the
+        # last token of a lone newline is the newline token whatever this
+        # vocabulary happens to call it.  An empty result disables the anchor,
+        # which puts the behaviour back to the unanchored search rather than
+        # silently finding no boundaries at all.
+        _nl = self.tok("\n")
+        self._turn_pre = {_nl[-1]} if _nl else set()
         tb = ct.create_string_buffer(1 << 17)
         n = L.llama_model_meta_val_str(self.mdl, b"tokenizer.chat_template", tb, len(tb))
         self.tpl = tb.raw[:n].decode("utf-8") if n > 0 else None
+        # The model's own Jinja template, compiled, so that reading it and
+        # executing it stop being different things.  See chat_template.py for why
+        # llama_chat_apply_template was not executing it, and for the one thing
+        # the template gets wrong that this engine has to work around.
+        _tmpl_mode = template_mode()
+        self.ct = ChatTemplate(self.tpl if _tmpl_mode else None, log,
+                               why=None if _tmpl_mode else
+                               "off (CC_TMPL=0); llama_chat_apply_template is in use",
+                               mode=_tmpl_mode)
+        self.ct_mode = _tmpl_mode
         log(f"n_ctx={n_ctx} nv={self.nv} {time.time()-t0:.1f}s "
             f"tpl={'yes, ' + str(len(self.tpl)) + ' chars' if self.tpl else 'none'} "
             f"n_batch={bs} n_ubatch={ub} kv_unified={self.kvu}")
+        log(f"chat template: {self.ct.line()}")
+        # The same settings again, in the terms LM Studio's load panel uses, so
+        # that "cc_srv runs what LM Studio runs" is a line the startup log can be
+        # checked against rather than a claim to be taken on trust.  Every value
+        # is read off the params struct that was actually handed to the context,
+        # never off a table -- llama.cpp moved use_mmap/use_mlock into
+        # load_mode/lazy_mode and dropped those fields entirely, and a hardcoded
+        # description would still be naming them.
+        #
+        # Which rows of that panel have no counterpart here is stated rather than
+        # hidden: Context Checkpoints is --ctx-checkpoints, a llama-server SLOT
+        # option with no field in llama_context_params, and the nearest thing
+        # cc_srv has to it is the prefix archive.  load_mode/lazy_mode -1/1 are
+        # AUTO, which is what "try mmap" and "keep model in memory" ask for.
+        log(f"load settings: n_batch={bs} n_ubatch={ub} n_seq_max={nseq} "
+            f"kv_unified={self.kvu} n_rs_seq={n_rs} "
+            f"offload_kqv={bool(cp.okq)} op_offload={bool(cp.oo)} "
+            f"swa_full={bool(cp.swaf)} threads={cp.nt}/{cp.ntb} "
+            f"load_mode={mp.lm} lazy_mode={mp.lz} flash_attn={cp.fat} "
+            f"rope={cp.rfb}/{cp.rfs}")
+
+    def tmpl_jinja(self, msgs: list, add_ass: bool = True,
+                   thinking: bool | None = None):
+        """The template's own render, or None if it would not produce one.
+
+        Separate from tmpl() on purpose.  tmpl() falls back to the library
+        renderer, which is right when a caller only wants "some prompt", and
+        wrong for prepare(): the two renderers end the prompt differently -- the
+        library path appends the reasoning block, a bare library render does not
+        -- so a caller that cannot tell which one it got cannot tell what it is
+        generating from.  Measured: 18521 identical tokens and then a two-token
+        difference in the head.
+        """
+        if self.ct_mode == 0:
+            return None
+        if self.ct_mode == 1:
+            return None            # mode 1 is spliced below; see tmpl()
+        return self.ct.render(msgs, add_ass, thinking)
 
     # ---------------- basics ----------------
-    def tmpl(self, msgs: list, add_ass: bool = True) -> str:
-        """[(role, content)] -> one string, flattened by the model's own template."""
+    def tmpl(self, msgs: list, add_ass: bool = True,
+             thinking: bool | None = None) -> str:
+        """[(role, content)] -> one string, flattened by the model's own template.
+
+        Three modes, from CC_TMPL (see chat_template.py):
+
+          0  llama_chat_apply_template, which does not run Jinja at all and
+             silently falls back to ChatML -- so the system message this model's
+             template injects never appears.
+          1  the template's leading system block, then THIS engine's rendering of
+             the conversation from the first user turn on.  The block is the part
+             the engine cannot produce for itself; the bodies are the part the
+             template gets wrong for this memory, because it re-renders a
+             finished assistant turn without the empty reasoning block it
+             generated from, and a prompt that diverges anywhere has to be
+             rebuilt from zero here.
+          2  the template does everything.  Kept as the reference for what the
+             template does unassisted; measured to cost the whole cache.
+
+        The splice in mode 1 is why the order matters: taking the block and
+        leaving the bodies keeps every byte a previous turn ended on exactly
+        where it was, so the prompt still EXTENDS the sequence and reuse still
+        happens.
+        """
+        if self.ct_mode == 2:
+            got = self.ct.render(msgs, add_ass, thinking)
+            return got if got is not None else self.tmpl_lib(msgs, add_ass)
+        if self.ct_mode == 1:
+            # The first message that is not a system message.  msgs_of emits at
+            # most one system message and always first, so this is 0 or 1 -- but
+            # it is computed rather than assumed, because a caller that puts the
+            # system block anywhere else would otherwise get it rendered twice.
+            k = next((i for i, (r, _) in enumerate(msgs) if r != "system"), len(msgs))
+            head = self.ct.system_block(msgs, thinking)
+            if head is not None:
+                body = self.tmpl_lib(msgs[k:], add_ass=False)
+                if not add_ass:
+                    return head + body
+                # The generation header also comes from the template, and it has
+                # to: enable_thinking is the only thing that distinguishes the
+                # closed empty reasoning block from an open one, and the library
+                # renderer cannot be told about a template variable at all.  Ask
+                # for it the same way as everything else here -- render and take
+                # the difference -- rather than writing the two spans out.
+                tail = self.ct.generation_head(msgs, thinking)
+                if tail is not None:
+                    return head + body + tail
+        return self.tmpl_lib(msgs, add_ass)
+
+    def tmpl_lib(self, msgs: list, add_ass: bool = True) -> str:
+        """The pre-Jinja path, kept as the fallback and for the A/B."""
         if not self.tpl:
             return "\n".join(f"<|{r}|>\n{c}" for r, c in msgs) + "\n<|assistant|>\n"
         arr = (Msg * len(msgs))()
@@ -843,10 +978,30 @@ class Eng:
         got = L.llama_tokenize(self.vcb, b, len(b), buf, n, True, True)
         return list(buf[:got])
 
-    def piece(self, t: int) -> str:
+    def piece(self, t: int) -> bytes:
+        """One token's BYTES.  Not text, and deliberately not named like it.
+
+        A token is a byte string: on this vocabulary a 4-byte emoji is three
+        tokens whose bytes are individually invalid UTF-8.  Decoding one token on
+        its own turns that character into U+FFFD somewhere it cannot be
+        recovered, so this returns bytes and every caller decides where the
+        decode happens -- ``utext`` for text, and once for a whole run.
+
+        The size is a retry rather than a hardcoded 64: llama_token_to_piece
+        returns the NEGATIVE of the length it needed, and slicing ``raw[:n]``
+        with that negative value would silently hand back all but the last n
+        bytes.  ddc_decode.py had the guard; this did not.
+        """
         b = ct.create_string_buffer(64)
         n = self.L.llama_token_to_piece(self.vcb, t, b, 64, 0, True)
-        return b.raw[:n].decode("utf-8", "replace")
+        if n < 0:
+            b = ct.create_string_buffer(-n)
+            n = self.L.llama_token_to_piece(self.vcb, t, b, len(b), 0, True)
+        return b.raw[:n]
+
+    def text_of(self, toks) -> str:
+        """A whole token run as text.  Decodes ONCE, over all the bytes."""
+        return utext.whole(b"".join(self.piece(t) for t in toks))
 
     def feed(self, ids: list[int], chunk: int | None = None):
         """Push ids into the KV.  Chunked because of the n_batch limit; the batch
@@ -920,15 +1075,35 @@ class Eng:
         assuming a layout; this file is already specific to one template (the
         stop strings, the assistant header), and a sentinel here would have to
         reproduce the template's tokenization to be worth anything.
+
+        The marker has to be ANCHORED, and that is not a refinement -- the
+        unanchored search is wrong on this project's own source.  eng.py contains
+        the line ``self._turn_mark = self.tok("<|im_start|>user")``, so a prompt
+        that includes eng.py contains the marker as ordinary text, and the search
+        returns that occurrence instead of the turn it was looking for.  Measured
+        on a real agent run reading src/: the boundary came back at token 16016 --
+        the first assistant turn -- for every request, so the archive stored and
+        restored one state at 16016 over and over while the prompt grew to 24000,
+        and every request re-forwarded everything after it.
+
+        A real turn marker follows a newline.  The occurrence inside source code
+        follows a quote.  That is the whole test, and it is derived from the
+        tokenizer rather than written down as a number: ``_turn_pre`` is whatever
+        token the newline really is on this vocabulary.
         """
         if not pids:
             return None
         mark = self._turn_mark
         if not mark:
             return None
+        pre = self._turn_pre
         for i in range(len(pids) - len(mark), -1, -1):
-            if list(pids[i:i + len(mark)]) == mark:
+            if list(pids[i:i + len(mark)]) != mark:
+                continue
+            # i == 0: a turn at the very start has nothing before it to check.
+            if i == 0 or not pre or pids[i - 1] in pre:
                 return i
+            self.st["turn_skip"] = self.st.get("turn_skip", 0) + 1
         return None
 
     def lcp(self, ids: list[int]) -> int:
@@ -1168,6 +1343,11 @@ class Eng:
 
         toks: list[int] = []
         text = ""
+        # Token bytes go in here and only whole characters come out, so a
+        # character split across tokens survives.  NOT flushed on a stop hit:
+        # whatever the decoder is still holding sits past the cut and is meant to
+        # be dropped with the rest of the tail.
+        _dec = utext.decoder()
         ns = max((len(x) for x in stop), default=0)
         hit = None
         nxt = self.top()                     # prediction at the current position
@@ -1179,7 +1359,7 @@ class Eng:
             if d is None:
                 toks.append(nxt); self.feed([nxt]); seq.append(nxt)
                 self.ngram_feed(seq, k, len(seq))
-                text += self.piece(nxt); st["gen"] += 1
+                text += _dec.decode(self.piece(nxt)); st["gen"] += 1
                 nxt = self.top()
             else:
                 bat = [nxt] + d[:m - 1]      # the free one goes first
@@ -1187,7 +1367,7 @@ class Eng:
                 if not acc:
                     toks.append(nxt); self.feed([nxt]); seq.append(nxt)
                     self.ngram_feed(seq, k, len(seq))
-                    text += self.piece(nxt); st["gen"] += 1
+                    text += _dec.decode(self.piece(nxt)); st["gen"] += 1
                     nxt = self.top()
                 else:
                     self.L.llama_memory_seq_cp(self.kmem, 1, 0, pos, pos + len(acc))
@@ -1196,7 +1376,7 @@ class Eng:
                     toks.extend(acc); seq.extend(acc)
                     self.ngram_feed(seq, k, len(seq))
                     for t in acc:
-                        text += self.piece(t)
+                        text += _dec.decode(self.piece(t))
                     st["gen"] += len(acc)
                     st["spec"] = st.get("spec", 0) + 1
                     st["spec_tok"] = st.get("spec_tok", 0) + len(acc)
@@ -1210,6 +1390,9 @@ class Eng:
             if hit:
                 text = text[:cut]
                 break
+        if hit is None:
+            # Nothing is pending a stop hit has discarded, so finish the decoder.
+            text += _dec.decode(b"", True)
         st["spec_r"] = st.get("spec_r", 0) + rounds
         if len(self.lgc) >= self.lgc_max:
             self.lgc.pop(next(iter(self.lgc)))
@@ -1527,6 +1710,7 @@ class Eng:
 
         toks: list[int] = []
         text = ""
+        _dec = utext.decoder()          # see gen_pl: bytes in, whole characters out
         ns = max((len(x) for x in stop), default=0)
         hit = None
         nxt = self.top()
@@ -1547,7 +1731,7 @@ class Eng:
             if d is None or d[0] != nxt:
                 self.feed([nxt]); self.seq.append(nxt)
                 self.ng_add(len(self.seq))
-                toks.append(nxt); text += self.piece(nxt); st["gen"] += 1
+                toks.append(nxt); text += _dec.decode(self.piece(nxt)); st["gen"] += 1
                 nxt = self.top()
             else:
                 acc, free = self.check(d, L)
@@ -1566,7 +1750,7 @@ class Eng:
                 self.ng_add(len(self.seq))
                 toks.extend(acc)
                 for t in acc:
-                    text += self.piece(t)
+                    text += _dec.decode(self.piece(t))
                 st["gen"] += len(acc)
                 st["spec"] = st.get("spec", 0) + 1
                 st["spec_tok"] = st.get("spec_tok", 0) + len(acc)
@@ -1582,6 +1766,8 @@ class Eng:
             if hit:
                 text = text[:cut]
                 break
+        if hit is None:
+            text += _dec.decode(b"", True)
         st["t_gen"] += time.time() - t0
         st["pl_round"] = st.get("pl_round", 0) + rounds
         st["pl_swap"] = st.get("pl_swap", 0) + spl
@@ -1777,7 +1963,7 @@ class Eng:
         trunc = len(out) >= max_new
         self.st["rcl"] += 1
         self.st["gen"] += len(out)
-        txt = gtxt if k2 >= len(gen) else "".join(self.piece(t) for t in out)
+        txt = gtxt if k2 >= len(gen) else self.text_of(out)
         return out, txt, {"hit": "rcl", "pre": 0, "reuse": len(pids),
                           "n": len(out), "trunc": trunc}
 
@@ -1973,6 +2159,7 @@ class Eng:
             trace = Trace()
         toks: list[int] = []
         text = ""
+        _dec = utext.decoder()          # see gen_pl: bytes in, whole characters out
         emit = 0
         hit = None
         ns = max((len(x) for x in stop), default=0)
@@ -1989,7 +2176,7 @@ class Eng:
             if ent is not None:
                 nxt, how = self.lookup(kk, ent)
                 if nxt is not None:
-                    toks.append(nxt); self.feed([nxt]); text += self.piece(nxt)
+                    toks.append(nxt); self.feed([nxt]); text += _dec.decode(self.piece(nxt))
                     h.update(self.tbytes(nxt)); st["gen"] += 1
                     st["hit_tok"] = st.get("hit_tok", 0) + 1
                     st["hit_" + how] = st.get("hit_" + how, 0) + 1
@@ -2006,7 +2193,7 @@ class Eng:
                 trace.append(ids_, lg_)
             else:
                 t = self.top()
-            toks.append(t); self.feed([t]); text += self.piece(t)
+            toks.append(t); self.feed([t]); text += _dec.decode(self.piece(t))
             h.update(self.tbytes(t))
             st["gen"] += 1
             cut = len(text)
@@ -2023,6 +2210,8 @@ class Eng:
             if hit:
                 text = text[:cut]
                 break
+        if hit is None:
+            text += _dec.decode(b"", True)
         dt = time.time() - t0
         st["t_gen"] += dt
         # Plain decoding, one token at a time: the yardstick the governor
@@ -2170,6 +2359,7 @@ class Eng:
             out += (f" | qhit={s['qhit']} qsaved={s['qsaved']} qedit={s['qedit']} "
                     f"qstore={s['qstore']} qmem={m['qc']:.3f}MB "
                     f"qtopk={s['qtopk_s']:.1f}s {self.qc.line()}")
+        out += f" | {self.ct.line()}"
         return out
 
 

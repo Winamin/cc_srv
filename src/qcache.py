@@ -41,6 +41,8 @@ import re
 
 import numpy as np
 
+import utext
+
 # Replayed tokens are emitted by argmax over the stored row, so a stored trace
 # reproduces exactly the tokens it was recorded from.  The width only bounds
 # which edits count as "in distribution" for the model at that position.
@@ -420,7 +422,7 @@ class QCache:
         cut = min(max_new, len(entry.toks))
         shortened = cut < len(entry.toks)
         toks = list(entry.toks[:cut])
-        text = _trim("".join(decode(t) for t in toks), entry.stopk) if shortened else entry.text
+        text = _trim(utext.whole(b"".join(decode(t) for t in toks)), entry.stopk) if shortened else entry.text
         info = {"qreuse": match.level, "why": match.reason, "saved": 0,
                 "replayed": 0, "edited": 0, "edit_applied": 0, "edit_rejected": 0}
 
@@ -447,7 +449,7 @@ class QCache:
             # A refused substitution falls back to the model's argmax inside
             # _validate, so the edited string is no longer what the tokens say,
             # and only the tokens are authoritative.
-            text = _trim("".join(decode(t) for t in toks), entry.stopk)
+            text = _trim(utext.whole(b"".join(decode(t) for t in toks)), entry.stopk)
         toks = toks[:max_new]
         info["saved"] = len(toks)
         self.st["saved_tok"] += len(toks)

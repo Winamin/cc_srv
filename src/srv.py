@@ -87,6 +87,16 @@ CNT_FIX = "<total_tokens>" + os.environ.get("CC_CNT_N", "15000000") + " tokens l
 AH = not os.environ.get("CC_KEEP_AH")
 AH_HEAD = "<think>\n\n</think>\n\n"
 
+# CC_CAP=1 adds the raw generated text to each request's record.
+#
+# Off by default because it is a debugging aid, not telemetry: a reply is up to
+# tens of thousands of characters and this file is otherwise one compact line per
+# request.  It exists because the engine's cache decides reuse by comparing
+# TOKENS, and the one thing that could not be checked was the bytes the model
+# actually produced for an assistant turn against the bytes the engine renders
+# when that turn comes back.  Nothing recorded the former.
+CAP = os.environ.get("CC_CAP") == "1"
+
 # D. thinking mode (CC_THINK=1, or a request carrying an Anthropic `thinking`).
 #
 # The model writes its reasoning inside <think>...</think>.  By default that is
@@ -113,7 +123,17 @@ AH_HEAD = "<think>\n\n</think>\n\n"
 # refused rather than obeyed, and history is rendered with its reasoning stripped
 # (see msgs_of).  Restarting with CC_THINK=1 is the only way back on -- which is
 # the point: a lock a runtime call can undo is not a lock.
-THINK = os.environ.get("CC_THINK", "0") == "1"     # startup default
+#
+# The DEFAULT is now on, because the lock does something bigger than hide the
+# reasoning: it makes prepare() ask the template for its closed empty reasoning
+# block, and that block is the model being told its reasoning is already
+# finished.  The model then answers without reasoning at all -- a broken chain of
+# thought, not a hidden one -- and, because the client is never given a thinking
+# block to echo back, the next turn's prompt cannot reproduce that block either,
+# which is what costs the cache under CC_TMPL=2.  Off is still available for
+# anyone who wants it, and srv.py warns at startup when it is combined with the
+# template that cannot round-trip it.
+THINK = os.environ.get("CC_THINK", "1") == "1"     # startup default
 # The hard lock.  True means "this process may never think", whatever any client
 # asks and whatever the runtime switch is told.
 THINK_LOCKED = not THINK
@@ -227,7 +247,7 @@ def msgs_of(system, msgs: list, tools: list | None) -> list:
                     # leaving it in would defeat the lock on every turn after a
                     # thinking turn -- exactly the case the lock exists to close.
                     if not THINK_LOCKED:
-                        think = b.get("thinking", "")
+                        think = strip_think_tags(b.get("thinking", ""))
                 elif bt == "tool_use":
                     ch.append("<tool_call>\n" + json.dumps(
                         {"name": b.get("name"), "arguments": b.get("input", {})},
@@ -239,8 +259,23 @@ def msgs_of(system, msgs: list, tools: list | None) -> list:
                                         if isinstance(x, dict))
                     ch.append("<tool_result>\n" + str(inner) + "\n</tool_result>")
         if role == "assistant" and AH:
-            # C. drop the empty blocks -- do not let "\n".join invent newlines
-            body = "\n".join(x for x in ch if x)
+            # C. Concatenate, never join.  The blocks the client sends back are a
+            #    PARTITION of the bytes the model produced, not a list that wants
+            #    separators between its items -- the separators are already in the
+            #    text.  This was "\n".join, which inserted one newline the model
+            #    never emitted, and only on turns that carried BOTH text and a
+            #    tool call (a single-element join adds nothing, which is why
+            #    tool-only turns round-tripped and text+tool turns did not).
+            #
+            #    Measured against the engine's own captured output:
+            #        generated   ...command:\n\n\n<tool_call>{"name": "Bash"...
+            #        re-rendered ...command:\n\n\n\n<tool_call>{"name": "Bash"...
+            #    One extra byte per assistant turn, against a KV holding one
+            #    fewer.  Reuse needs the re-render to be a prefix of what the
+            #    model produced, so that byte cost every turn from there on --
+            #    which is the residual pin at 19274 that the <think> fix left
+            #    behind.
+            body = "".join(ch)
             if think is not None:
                 # Rebuild the bytes the model produced, exactly.  It generated
                 # "<think>\n" (from the prompt) + reasoning + "</think>\n\n" +
@@ -253,6 +288,35 @@ def msgs_of(system, msgs: list, tools: list | None) -> list:
         else:
             out.append((role, "\n".join(ch)))
     return out
+
+
+def strip_think_tags(t: str) -> str:
+    """Remove a <think>/</think> wrapper a client put back around reasoning.
+
+    The engine sends the reasoning WITHOUT the tags -- the prompt already opened
+    the block, so the model never emits the opening tag and split_think does not
+    include it.  Measured on a live stream: the first thinking_delta is
+    ``{"thinking": "The"}``, no tag.
+
+    The client, though, echoes the block back wrapped:
+    ``"<think>\\nThe user wants me to read all 14 Python files..."``.  Re-wrapping
+    that here produced ``<think>\\n<think>\\nThe user...`` -- two extra tokens in
+    every assistant turn, against a KV that holds only one.  Reuse needs the
+    re-render to be a prefix of what the model produced, so two extra tokens cost
+    the whole history: measured, every request fell through to the archive and
+    re-forwarded everything after the system block, and with CC_ARCHIVE=0 every
+    single request was a full prefill.
+
+    Stripping the tags makes the render idempotent -- it is the same output
+    whether the client wrapped the block or not.
+    """
+    if t.startswith("<think>"):
+        t = t[7:]
+        if t.startswith("\n"):
+            t = t[1:]          # the newline the block puts after the tag
+    if t.endswith("</think>"):
+        t = t[:-8]
+    return t
 
 
 def drop_think(t: str) -> str:
@@ -395,36 +459,61 @@ def prepare(req):
     """
     m = msgs_of(req.get("system", ""), req.get("messages", []), req.get("tools") or [])
     turn = turn_key(m)
-    if AH:
-        # B. the assistant header cannot be hardcoded -- the layout (how many
-        #    newlines, the separator before the body) belongs to the template.
-        #    Render one sentinel message and take the span between the end of the
-        #    base rendering and the sentinel: that is everything the template
-        #    emits before an assistant body.
-        #    Trap 1: do not write probe.endswith(SENT) -- the template renders a
-        #            message ending in assistant completely (including
-        #            <|im_end|>), so endswith never holds, tail comes back empty,
-        #            and the generation prompt does not even contain
-        #            '<|im_start|>assistant' (the measured divergence token was
-        #            previous-turn <think> versus this-turn <|im_start|>).
-        #    Trap 2: find() must start at len(base) -- that is what brings in the
-        #            separator before the body, and only then are the two sides
-        #            byte-identical.
-        SENT = "SENTINELPROBE"
-        base = E.tmpl(m, add_ass=False)
-        probe = E.tmpl(m + [("assistant", SENT)], add_ass=False)
-        i = probe.find(SENT, len(base))
-        # D. Thinking is a TEMPLATE variable (enable_thinking) and this binding
-        #    cannot pass template kwargs -- but the flag only changes this one
-        #    span: off, the template closes an empty block, which is the model
-        #    being told its reasoning is already done.  Leaving it OPEN is the
-        #    same instruction to think, and it keeps the round trip closed: the
-        #    model then produces "<think>\n" + reasoning + "</think>\n\n" + answer
-        #    and msgs_of rebuilds exactly those bytes when the turn comes back.
-        head = THINK_HEAD if want_think(req) else AH_HEAD
-        p = base + (probe[len(base):i] if i >= 0 else "") + head
-    else:
-        p = E.tmpl(m, add_ass=True)
+    # The template is used only when it actually RENDERED.  Choosing the branch on
+    # E.ct.active instead -- which is what this did at first -- silently changed
+    # the prompt whenever the template refused, because the two paths do not end
+    # the same way:
+    #
+    #   template / sentinel path   ...<|im_start|>assistant\n<think>\n
+    #   bare tmpl_lib(add_ass)     ...<|im_start|>assistant\n
+    #
+    # Measured on a recorded Claude Code request (bench/_diag_head.py): the two
+    # are identical for 18521 tokens and then differ by exactly the two tokens of
+    # the reasoning block.  That matters far more than it looks, because the
+    # template refuses EVERY request from a real client -- Claude Code puts a
+    # role: system message at index 1, 4, 7, and the template forbids any system
+    # message that is not first.  So the fallback was not a fallback, it was the
+    # path, and it was generating from a head this engine had never used before:
+    # the assistant turn could no longer re-render to the bytes the model made, no
+    # worker sequence was ever a strict prefix of the next prompt, and every
+    # request fell through to the archive and re-forwarded the whole history.
+    #
+    # With the template refusing, the old path is restored exactly.
+    p = E.tmpl_jinja(m, True, want_think(req)) if E.ct.active else None
+    if p is None:
+        if not AH:
+            p = E.tmpl_lib(m, add_ass=True)
+        else:
+            # B. the assistant header cannot be hardcoded -- the layout (how many
+            #    newlines, the separator before the body) belongs to the template.
+            #    Render one sentinel message and take the span between the end of
+            #    the base rendering and the sentinel: that is everything the
+            #    template emits before an assistant body.
+            #    Trap 1: do not write probe.endswith(SENT) -- the template renders
+            #            a message ending in assistant completely (including
+            #            <|im_end|>), so endswith never holds, tail comes back
+            #            empty, and the generation prompt does not even contain
+            #            '<|im_start|>assistant' (the measured divergence token was
+            #            previous-turn <think> versus this-turn <|im_start|>).
+            #    Trap 2: find() must start at len(base) -- that is what brings in
+            #            the separator before the body, and only then are the two
+            #            sides byte-identical.
+            SENT = "SENTINELPROBE"
+            base = E.tmpl_lib(m, add_ass=False)
+            probe = E.tmpl_lib(m + [("assistant", SENT)], add_ass=False)
+            i = probe.find(SENT, len(base))
+            # D. Thinking is a TEMPLATE variable (enable_thinking) and
+            #    llama_chat_apply_template cannot be passed template kwargs -- but
+            #    the flag only changes this one span: off, the template closes an
+            #    empty block, which is the model being told its reasoning is
+            #    already done.  Leaving it OPEN is the same instruction to think,
+            #    and it keeps the round trip closed: the model then produces
+            #    "<think>\n" + reasoning + "</think>\n\n" + answer and msgs_of
+            #    rebuilds exactly those bytes when the turn comes back.  The two
+            #    spans below are what the Jinja path above gets from
+            #    enable_thinking instead.
+            head = THINK_HEAD if want_think(req) else AH_HEAD
+            p = base + (probe[len(base):i] if i >= 0 else "") + head
     if CNT is not None:
         # A. pin the counter to a constant -> the prefix is stable -> the fatal
         #    partial truncation is no longer needed
@@ -691,22 +780,29 @@ class Api(BaseHTTPRequestHandler):
                 msg += f" seq={info['seq']}"
             # The busiest line in the log; its own tag so it can be picked out.
             log("req " + msg, "info", "req")
-            record({"prompt_tokens": len(ids), "gen_tokens": len(r[0]),
-                    "hit": info["hit"], "pre": info.get("pre"),
-                    "reuse": info.get("reuse"), "p_raw": info.get("p_raw"),
-                    "cur": info.get("cur"), "seconds": round(time.time()-t0, 3),
-                    "turn_kind": None if turn is None else turn[0],
-                    "turn_digest": None if turn is None else turn[1].hex(),
-                    "max_tokens": mx, "stream": stream,
-                    "qpreuse": info.get("qpreuse"), "qwhy": info.get("qwhy"),
-                    "replayed": info.get("replayed"), "edited": info.get("edited"),
-                    "edit_applied": info.get("edit_applied"),
-                    "edit_rejected": info.get("edit_rejected"),
-                    # Deltas, not the engine's running totals: a consumer
-                    # reading this file otherwise sees a monotonically growing
-                    # "seconds" that is not this request's time.
-                    "prefill_seconds": round(pf, 3),
-                    "generation_seconds": round(gn, 3)})
+            rec = {"prompt_tokens": len(ids), "gen_tokens": len(r[0]),
+                   "hit": info["hit"], "pre": info.get("pre"),
+                   "reuse": info.get("reuse"), "p_raw": info.get("p_raw"),
+                   "cur": info.get("cur"), "seconds": round(time.time()-t0, 3),
+                   "turn_kind": None if turn is None else turn[0],
+                   "turn_digest": None if turn is None else turn[1].hex(),
+                   "max_tokens": mx, "stream": stream,
+                   "qpreuse": info.get("qpreuse"), "qwhy": info.get("qwhy"),
+                   "replayed": info.get("replayed"), "edited": info.get("edited"),
+                   "edit_applied": info.get("edit_applied"),
+                   "edit_rejected": info.get("edit_rejected"),
+                   # Deltas, not the engine's running totals: a consumer
+                   # reading this file otherwise sees a monotonically growing
+                   # "seconds" that is not this request's time.
+                   "prefill_seconds": round(pf, 3),
+                   "generation_seconds": round(gn, 3)}
+            if CAP:
+                # The tokens the KV now holds past the prompt, as text.  This is
+                # what the NEXT request has to re-render byte-for-byte for the
+                # sequence to be reusable, and it is the only copy of it.
+                rec["reply"] = r[1]
+                rec["reply_ids"] = list(r[0])
+            record(rec)
             return r
 
         def parts(text):
@@ -1005,6 +1101,20 @@ def main():
     log_setup(LOGDIR)
     logit(f"loading engine n_ctx={n_ctx} nseq={nseq}")
     E = Eng(n_ctx=n_ctx, nseq=nseq, workers=workers, log=logit)
+    # Say the coupling out loud rather than leaving it to be discovered as a
+    # cache that quietly stopped working.  The template renders a finished
+    # assistant turn from its content, so it can only reproduce the KV if the
+    # reasoning came back -- and reasoning comes back only if the client was
+    # given it.  With thinking locked off there is no reasoning to give back.
+    if E.ct_mode == 2 and THINK_LOCKED:
+        logit("WARNING: CC_TMPL=2 with CC_THINK=0 -- the template cannot "
+              "re-render the closed empty reasoning block it generated from, so "
+              "every turn after an answer re-prefills its whole prompt. "
+              "Use CC_THINK=1 (keeps the cache, and the model's reasoning), or "
+              "CC_TMPL=1 (keeps the closed block AND the cache, no reasoning).")
+    if E.ct_mode == 1 and not THINK_LOCKED:
+        logit("note: CC_TMPL=1 renders the assistant turns itself, so reasoning "
+              "still round-trips; CC_TMPL=2 hands them to the template.")
     if workers > 1:
         BATCHER = Batcher(E, log=logit)
         logit(f"scheduler up: {len(E.work_seqs)} worker sequences "

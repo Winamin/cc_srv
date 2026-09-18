@@ -42,6 +42,7 @@ import threading
 import time
 
 import spec
+import utext
 from eng import Progress
 
 # A step is only batched together with the steps either side of it, so the
@@ -60,7 +61,7 @@ class Job:
                  "done", "result", "error", "t0", "prefilled", "reused",
                  "arc_at", "arc_done", "on_token", "pf_s", "gn_s", "on_serve",
                  "ddc", "scratch", "draft", "verifying", "shared", "arc_s",
-                 "prog")
+                 "prog", "dec")
 
     def __init__(self, prompt, max_new, stop, turn=None, on_token=None,
                  on_serve=None):
@@ -126,10 +127,25 @@ class Job:
         # step, so a shared reporter would attribute each job's chunks to whoever
         # reported last.
         self.prog = None
+        # Incremental UTF-8 for this job's own token bytes.  Per job, not per
+        # scheduler: several jobs' tokens arrive interleaved from one step, and a
+        # shared decoder would splice one reply's partial character onto
+        # another's.  See utext and Batcher._emit.
+        self.dec = utext.decoder()
         self.done = threading.Event()
         self.result = None
         self.error = None
         self.t0 = time.time()
+
+    def seal(self) -> str:
+        """Finalise the text: flush the decoder and return everything.
+
+        The flush is what turns a trailing partial character into the U+FFFD it
+        has to be.  Skipping it would DROP that character instead, which is a
+        quieter bug than the corruption this replaced.
+        """
+        self.text = "".join(self.raw) + self.dec.decode(b"", True)
+        return self.text
 
     def finish(self):
         self.state = DONE
@@ -800,7 +816,7 @@ class Batcher:
                     # whole batch and every other request sharing it, rather than
                     # just truncating this one.
                     job.stopped = None
-                    job.text = "".join(job.raw)
+                    job.seal()
                     job.finish()
                 elif job.state != DONE:
                     self._index_and_offer(job, row, token)
@@ -841,23 +857,31 @@ class Batcher:
         Stopping is decided on TEXT, exactly as Eng.gen does it: a stop string
         can straddle tokens, and trimming at the token level would either emit
         half a marker or swallow a token that is not part of one.
+
+        The token's BYTES go through an incremental decoder rather than being
+        decoded on their own.  A token is a byte string, not a character -- a
+        4-byte emoji is three tokens here, and decoding each one separately
+        yields three U+FFFD that no amount of joining can undo.  The decoder
+        also buffers a trailing partial character, so what reaches on_token is
+        always whole characters and the stream cannot carry a replacement
+        character either.
         """
         piece = self.e.piece(token)
-        job.raw.append(piece)
-        if job.on_token is not None:
+        chunk = job.dec.decode(piece)
+        job.raw.append(chunk)
+        if job.on_token is not None and chunk:
             # Hand over the increment and let the callback decide what is safe to
             # send: it knows about think blocks, tool calls and stop strings, and
             # this function deliberately does not.
-            job.on_token(piece)
+            job.on_token(chunk)
         if len(job.out) >= job.max_new:
             job.stopped = None
-            job.text = "".join(job.raw)
+            job.seal()
             job.finish()
             return
-        # Rebuilding from the piece list each time is O(n^2) in the reply length,
-        # but a reply is tens to hundreds of tokens and this keeps the text
-        # exactly what the pieces say -- including a multi-byte character split
-        # across two tokens, which decoding token by token would corrupt.
+        # Rebuilt from the piece list each time, which is O(n^2) in the reply
+        # length -- but a reply is tens to hundreds of tokens, and this keeps the
+        # text exactly what the pieces say.
         job.text = "".join(job.raw)
         cut = len(job.text)
         for s in job.stop:

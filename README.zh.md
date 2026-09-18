@@ -200,6 +200,98 @@ assert。
 序列一个 token 都拿不到。现在 chunk 独立地封顶在 128，并可用 `CC_BATCH_CHUNK` 直接指定。
 **每步的预算**仍然随 `n_batch` 放大，那才是这个设置该管的事。
 
+### 与 LM Studio 加载面板逐行对照
+
+引擎每次启动都会打印它实际应用的参数，所以这是**可以核对的一行日志**，而不是一句声明：
+
+```
+load settings: n_batch=2048 n_ubatch=512 n_seq_max=4 kv_unified=True n_rs_seq=0
+offload_kqv=True op_offload=True swa_full=True threads=4/4
+load_mode=-1 lazy_mode=1 flash_attn=-1 rope=0.0/0.0
+```
+
+| LM Studio | 对应字段 | 实际值 |
+|---|---|---|
+| CPU 线程池大小 4 | `n_threads` | 4/4 —— llama.cpp 自己的默认就是 4 |
+| 评估批处理大小 2048 | `n_batch` | 2048，由 `CC_N_BATCH` 设定 |
+| Physical Batch Size 512 | `n_ubatch` | 512，由 `CC_N_UBATCH` 设定 |
+| Max Concurrent Predictions 4 | `n_seq_max` | `CC_BATCH_N=3` 时为 4（3 worker + 1 archive 槽） |
+| Unified KV Cache 开 | `kv_unified` | 开 |
+| 将 KV 缓存卸载到 GPU 开 | `offload_kqv` | 开 —— llama.cpp 默认 |
+| 保持模型在内存中 / 尝试 mmap | `load_mode`、`lazy_mode` | `-1`/`1`，都是 AUTO —— llama.cpp 默认 |
+| RoPE 频率基/比例 自动 | `rope_freq_base`、`rope_freq_scale` | `0.0`/`0.0`，0 = 用模型里的值 |
+| Context Checkpoints 32 | —— | **没有对应项**，见下 |
+
+除最后一行外全部已经等于 LM Studio 的值，而且多数是因为**它们本来就是 llama.cpp 的
+默认值** —— 那个面板大体上只是在显示库的默认行为。真正被 cc_srv 钉住的，是与默认值不同
+的那四个：`n_batch`、`n_ubatch`、`kv_unified`、`n_seq_max`。
+
+**Context Checkpoints 在这里没有对应项，也不可能有。** 它是 `--ctx-checkpoints`，一个
+llama-server 的**槽位**选项：`llama_context_params` 里根本没有这个字段，实现位于
+llama-server 的服务端代码里，而直接绑定 `llama.dll` 的调用方根本不会跑到那段代码。
+库层面的近似物是 `n_rs_seq`（"每序列的回滚快照数"），`CC_N_RS_SEQ` 可以设置它。但它没用：
+设成 32 时上下文确实回读为 32，可部分 `llama_memory_seq_rm` 依旧返回 false，无论切在哪
+序列长度都纹丝不动（`bench/_diag_rs_seq.py`）。这些快照服务的回滚路径只有投机解码那条
+支线能走到，所以它保持 0。cc_srv 对同一问题的答案是**前缀 archive**，那是另一套机制：
+在分叉点保存整个状态、再整块恢复，而不是把某个序列倒回去。
+
+另外注意这个构建里**已经没有 `use_mmap` / `use_mlock` 了** —— llama.cpp 把它们并进了
+`load_mode` 和 `lazy_mode` 两个枚举，所以上表写的是这两个。
+
+### 模型自带的 chat template
+
+这个模型在 `tokenizer.chat_template` 里带了 7950 个字符的 Jinja。引擎读它，但**没有执行
+它**。它把那个字符串交给的 `llama_chat_apply_template`，函数自己在头文件里写着：
+
+> NOTE: This function does not use a jinja parser. It only support a pre-defined
+> list of template.
+
+这个模板不在那 54 个内置模板里，于是那次调用**静默回落成裸 ChatML**。一个最简单的用户轮
+实测（`bench/_diag_template.py`）：
+
+```
+llama_chat_apply_template   <|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n
+真 Jinja                    <|im_start|>system\nYou are Qwythos, a model created by
+                            Empero AI. ...<|im_end|>\n<|im_start|>user\nhello<|im_end|>\n
+                            <|im_start|>assistant\n<think>\n
+```
+
+**模型从来不知道自己是 Qwythos。** `src/chat_template.py` 用真正的 Jinja 引擎渲染它，
+和 llama-server 一样。
+
+同一段对话跑两轮，引擎已预热，system 前导 2005 token：
+
+| `CC_TMPL` | `CC_THINK` | 渲染器 | 第 2 轮转发 | 命中复用 |
+|---|---|---|---|---|
+| `0` | 0 | 只用 library | 20 | 2007 |
+| `1` | 0 | 模板的 system 块 | 20 | 2035 |
+| `2` | 0 | 模板全权渲染 | 2048 | 0 |
+| **`2`（默认）** | **1（默认）** | **模板全权渲染** | **18** | **2083** |
+
+第 1 轮在 `CC_TMPL=1` 下是 2033 token，`0` 下是 2005 —— 多出来的 **28 个 token 就是那条
+身份消息**，也是两者全部的区别。
+
+#### 模板和 thinking 是同一个设置，不是两个
+
+`CC_TMPL=2` 能命中缓存，`CC_TMPL=2` + `CC_THINK=0` 不能 —— 而原因和 CoT 被破坏是同一个。
+
+模板是**从内容重建**已完成的 assistant 轮的。所以它下一轮拼出的提示词只有在**推理被带回来**
+时才能对上 KV，而推理只有在**客户端拿到过**时才会被带回来：回复里的 Anthropic `thinking`
+块就是客户端下一轮会回传的东西。
+
+thinking 被锁掉时，`prepare()` 向模板要的是那个闭合的空推理块 ——
+`<|im_start|>assistant\n<think>\n\n</think>\n\n`。那**不是把推理藏起来，而是在告诉模型
+「你的推理已经结束了」**，于是它根本不做推理就作答。客户端因此没有 thinking 块可回传，
+模板就把那一轮渲染成 `<|im_start|>assistant\n…`，而 KV 里存的不是这个。
+
+这个分叉是致命的而不只是贵，因为这里的复用不是 LCP：只有当前提示词**延长**了序列已有的内容
+时才复用，因为这个混合记忆上的部分截断是空操作。LCP 找到了却被拒 —— 请求日志里
+`p_raw=2026` 和 `reuse=0` 同时出现。任何位置的分叉都要付掉它之后的全部。
+
+所以 **`CC_TMPL=2` 蕴含 thinking**，两者冲突时 `srv.py` 会在启动时警告。如果 thinking 必须
+锁着，答案是 `CC_TMPL=1`：assistant 轮由引擎自己的渲染器产出，它能重现那个闭合块，正文照样
+对得上 KV —— 而 system 块仍然来自模板，身份消息还在。
+
 **投机解码。** `CC_DDC` 复用模型已经产出过的延续，再批量验证。草稿来自上下文本身，
 唯一代价是验证；草稿落地时一轮约快 3 倍，不落地时是净亏。所以由**两道闸门**决定它
 什么时候运行。
@@ -257,6 +349,7 @@ assert。
 | `CC_BATCH_WAIT` | 512 | 为免等最忙的 worker，愿意让出的前缀 token 数 |
 | `CC_N_BATCH` | 2048 | 逻辑批：一次 `llama_decode` 最多携带多少 token。同时也决定调度器每步的 token 预算 |
 | `CC_N_UBATCH` | 512 | 物理批：GPU 一次前向实际计算多少 token。必须 ≤ `CC_N_BATCH`。显存开销线性增长 |
+| `CC_N_RS_SEQ` | 0 | 每序列的回滚快照数（`n_rs_seq`）。上下文会接受并回读这个值，但部分 `seq_rm` 依然失败（见下文对照表），所以保持关闭 |
 | `CC_BATCH_CHUNK` | 128 | 单个 prefill 最多能从一步里拿走多少 token。刻意不与 `CC_N_BATCH` 挂钩 |
 | `CC_PROGRESS` | 1 | 报告 prefill 进度；`0` 关闭 |
 | `CC_PROGRESS_STEP` | 10 | 两条进度日志之间的百分比间隔；`0` 同样关闭 |

@@ -60,6 +60,40 @@ Batched serving (experimental, off by default; see USAGE.md section 6.5):
                     numerics, not a race).
     CC_BATCH_N=4    sequences, i.e. how many requests can be in flight at once
 
+Chat template (CC_TMPL=2, the default; see chat_template.py):
+    CC_TMPL=2       the model's own tokenizer.chat_template, rendered with a real
+                    Jinja engine the way llama-server does.  Handing that string
+                    to llama_chat_apply_template never executed it: the function
+                    does not run Jinja at all and silently falls back to plain
+                    ChatML for any template outside its 54 built-ins, which is
+                    why the system message naming the model never reached the
+                    prompt.
+                    It hits the cache, but ONLY together with thinking -- the
+                    template rebuilds a finished assistant turn from its content,
+                    so the turn only round-trips if the reasoning came back, and
+                    reasoning comes back only if the client was given it.  See
+                    CC_THINK below.
+    CC_TMPL=1       take only the template's system block (identity message
+                    included) and render the assistant turns with this engine's
+                    own renderer.  That renderer does reproduce the closed empty
+                    reasoning block, so this is the mode to use when thinking
+                    must stay locked off: cache kept, identity kept, no reasoning
+    CC_TMPL=0       library only: llama_chat_apply_template.  No identity message
+
+Thinking (CC_THINK=1, the default):
+    CC_THINK=1      the model reasons, and the reasoning is delivered as
+                    Anthropic thinking blocks.  Delivering them is what lets the
+                    client echo them back on the next turn, which is what makes
+                    CC_TMPL=2 round-trip and hit the cache.
+    CC_THINK=0      HARD LOCK.  Refuses /think?on=1 and the client's own
+                    thinking field, and strips reasoning out of history.  It also
+                    makes prepare() ask the template for its closed empty
+                    reasoning block, which tells the model its reasoning is
+                    already finished -- so the model answers with no chain of
+                    thought at all, not a hidden one.  Combined with CC_TMPL=2
+                    that also costs the cache, and the server says so at startup.
+    GET /think?on=1 live switch (refused while locked)
+
 Prefix archive (on by default; CC_ARCHIVE=0 turns it off.  See USAGE.md 6.4):
     CC_ARCHIVE=1    keep whole KV states at the points where requests have
                     actually diverged, in spare sequences, and restore one

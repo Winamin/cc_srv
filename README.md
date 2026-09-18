@@ -281,6 +281,114 @@ The chunk is now capped at 128 independently of `n_batch`, and `CC_BATCH_CHUNK`
 sets it directly. The *step budget* still scales with `n_batch`, which is what
 that setting should control.
 
+### Against LM Studio's load panel, row by row
+
+The engine prints what it actually applied at every start, so this is a line to
+check rather than a claim to take on trust:
+
+```
+load settings: n_batch=2048 n_ubatch=512 n_seq_max=4 kv_unified=True n_rs_seq=0
+offload_kqv=True op_offload=True swa_full=True threads=4/4
+load_mode=-1 lazy_mode=1 flash_attn=-1 rope=0.0/0.0
+```
+
+| LM Studio | here | value |
+|---|---|---|
+| CPU thread pool size 4 | `n_threads` | 4/4 — llama.cpp's own default is already 4 |
+| Evaluation batch size 2048 | `n_batch` | 2048, set by `CC_N_BATCH` |
+| Physical batch size 512 | `n_ubatch` | 512, set by `CC_N_UBATCH` |
+| Max concurrent predictions 4 | `n_seq_max` | 4 with `CC_BATCH_N=3` (3 workers + 1 archive slot) |
+| Unified KV cache on | `kv_unified` | on |
+| Offload KV cache to GPU on | `offload_kqv` | on — llama.cpp's default |
+| Keep model in memory / try mmap | `load_mode`, `lazy_mode` | `-1`/`1`, both AUTO — llama.cpp's defaults |
+| RoPE base/ratio auto | `rope_freq_base`, `rope_freq_scale` | `0.0`/`0.0`, 0 = from model |
+| Context checkpoints 32 | — | **no counterpart**; see below |
+
+Every row but the last is already at LM Studio's value, most of them because
+they *are* llama.cpp's defaults — the panel is largely showing what the library
+does anyway. The rows cc_srv actually pins are the four that differ from those
+defaults: `n_batch`, `n_ubatch`, `kv_unified` and `n_seq_max`.
+
+**Context checkpoints has no counterpart here, and cannot have one.** It is
+`--ctx-checkpoints`, a llama-server *slot* option: there is no field for it in
+`llama_context_params`, and the machinery lives in llama-server's server code,
+which a caller binding `llama.dll` directly never runs. The library-level
+analogue is `n_rs_seq`, "recurrent-state snapshots per seq for rollback", and
+`CC_N_RS_SEQ` sets it. It does not help: with it at 32 the context reports 32
+back, and a partial `llama_memory_seq_rm` still returns false and leaves the
+sequence exactly as long as before, at every cut tried
+(`bench/_diag_rs_seq.py`). The rollback those snapshots feed is reachable only
+from the speculative path, so it stays 0. cc_srv's answer to the same problem is
+the **prefix archive** — a different mechanism: whole states saved at fork
+points and restored wholesale, rather than one sequence rewound.
+
+Note also that this build no longer has `use_mmap`/`use_mlock` at all —
+llama.cpp folded them into the `load_mode` and `lazy_mode` enums — which is why
+the table names those instead.
+
+### The model's own chat template
+
+This model ships 7950 characters of Jinja in `tokenizer.chat_template`. The
+engine read it; it did not execute it. `llama_chat_apply_template`, the function
+it was handing that string to, says so itself:
+
+> NOTE: This function does not use a jinja parser. It only support a pre-defined
+> list of template.
+
+This template is not one of the 54 built-ins, so the call silently fell back to
+plain ChatML. Measured on a bare user turn (`bench/_diag_template.py`):
+
+```
+llama_chat_apply_template   <|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n
+the real Jinja              <|im_start|>system\nYou are Qwythos, a model created by
+                            Empero AI. ...<|im_end|>\n<|im_start|>user\nhello<|im_end|>\n
+                            <|im_start|>assistant\n<think>\n
+```
+
+The model was never being told what it is. `src/chat_template.py` fixes that by
+rendering the template with a real Jinja engine, exactly as llama-server does.
+
+Measured, same two-turn conversation, warm engine, 2005-token system preamble:
+
+| `CC_TMPL` | `CC_THINK` | renderer | turn 2 forwarded | reused |
+|---|---|---|---|---|
+| `0` | 0 | library only | 20 | 2007 |
+| `1` | 0 | template's system block | 20 | 2035 |
+| `2` | 0 | template does everything | 2048 | 0 |
+| **`2` (default)** | **1 (default)** | **template does everything** | **18** | **2083** |
+
+Turn 1 is 2033 tokens under `CC_TMPL=1` against 2005 under `0` — those 28 tokens
+are the identity message, and they are the entire difference.
+
+#### The template and thinking are one setting, not two
+
+`CC_TMPL=2` hits the cache, and `CC_TMPL=2` with `CC_THINK=0` does not — and the
+reason is the same reason the chain of thought was broken.
+
+The template renders a finished assistant turn *from its content*. So the prompt
+it builds on the next turn only reproduces the KV if the reasoning came back, and
+reasoning comes back only if the client was given it: an Anthropic `thinking`
+block in the reply is what the client echoes in the next request.
+
+With thinking locked off, `prepare()` asks the template for its closed empty
+reasoning block — `<|im_start|>assistant\n<think>\n\n</think>\n\n`. That is not a
+hidden reasoning block, it is the model being **told its reasoning is already
+finished**, so it answers with no reasoning at all. The client then has no
+thinking block to echo, and the template renders that turn as just
+`<|im_start|>assistant\n…`, which is not what the KV is holding.
+
+That divergence is fatal rather than merely costly, because reuse here is not an
+LCP: it is only taken when the prompt *extends* what the sequence already holds,
+since a partial truncation is a no-op on this hybrid memory. The LCP is found and
+then declined — the request log shows `p_raw=2026` next to `reuse=0`. A
+divergence anywhere costs everything from there on.
+
+So `CC_TMPL=2` implies thinking, and `srv.py` warns at startup if the two are set
+against each other. If thinking genuinely must stay locked, `CC_TMPL=1` is the
+answer: it renders the assistant turns with the engine's own renderer, which does
+reproduce the closed block, so the bodies still match the KV — and its system
+block still comes from the template, so the identity message is still there.
+
 **Speculative decoding.** `CC_DDC` reuses continuations the model has already
 produced and verifies them in a batch. Drafts come from the context itself, so
 the only cost is verification, and a round is roughly 3x faster when the draft
@@ -383,6 +491,9 @@ Everything is an environment variable.
 | `CC_BATCH_WAIT` | 512 | prefix tokens worth giving up to avoid waiting for the busiest worker |
 | `CC_N_BATCH` | 2048 | logical batch: the most tokens one `llama_decode` may carry. Also sizes each scheduler step's token budget |
 | `CC_N_UBATCH` | 512 | physical batch: what one GPU forward pass computes. Must be ≤ `CC_N_BATCH`. Costs VRAM linearly |
+| `CC_N_RS_SEQ` | 0 | recurrent-state snapshots per sequence for rollback (`n_rs_seq`). The context accepts it, but a partial `seq_rm` still fails — see the note below — so it stays off |
+| `CC_TMPL` | 2 | which renderer builds the prompt. `2` lets the model's Jinja template do everything; `1` takes only its system block and keeps this engine's bodies (the answer when `CC_THINK=0`); `0` is library-only |
+| `CC_THINK` | 1 | thinking. `1` delivers reasoning as Anthropic thinking blocks — required for `CC_TMPL=2` to hit the cache, since the client can only echo back what it was given. `0` is a hard lock and warns when combined with `CC_TMPL=2` |
 | `CC_BATCH_CHUNK` | 128 | most prompt tokens one prefill may take from a step. Deliberately not tied to `CC_N_BATCH` |
 | `CC_PROGRESS` | 1 | report prefill progress; `0` turns it off |
 | `CC_PROGRESS_STEP` | 10 | percent between progress lines; `0` silences it too |
