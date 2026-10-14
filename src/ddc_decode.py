@@ -1,9 +1,9 @@
 """Experimental target-verified DDC decoder; no HTTP/default-engine changes.
 
-Batch and sequential decoding can differ numerically on this quantized hybrid
-model. Verification is against the target's batch logits, not a proof of bitwise
-equivalence to sequential decoding. A partial acceptance always refreshes logits
-from the committed sequence; speculative logits cannot survive a refeed.
+Batch and sequential decoding differ numerically on this quantized hybrid
+model, so verification is against the target's batch logits, not bitwise
+equivalence to sequential decoding. A partial acceptance always refreshes the
+logits from the committed sequence; speculative logits cannot survive a refeed.
 """
 import ctypes as ct
 import time
@@ -27,22 +27,7 @@ def generate(e, prompt, max_new, cache=None, stop=("<|im_end|>",), prepared_logi
              max_context=0, reuse=None):
     """Return tokens, UTF-8 text, and synchronized wall-time/call counters.
 
-    A cache contains only committed past tokens. Verification runs on a scratch
-    sequence of the engine's choosing (``e.ddc_seq``), with the committed state
-    held on sequence 0; whole-state copies are used because hybrid recurrence
-    cannot be truncated. Timing includes lookups, feature extraction, copies,
-    refeeding and decoding. max_context disables DDC at that many committed
-    prompt+output tokens (0 means unlimited). Drafts cannot cross the boundary.
-    The caller's cache is retained for subsequent short requests; long requests
-    do not update it.
-
-    ``reuse`` is how many prompt tokens the KV already holds when the caller
-    established the prefix itself -- which is what the engine's serving path
-    does, so that the prefix archive can take part in the prefill (see
-    Eng.plan_prefix/feed_prefix). With it, this function forwards nothing and
-    only reads the logits the caller's prefill left; without it, it prefills by
-    plain APC. ``prepared_logits`` remains the benchmark-only shortcut, where the
-    caller restored a state identical to the whole prompt.
+    ``reuse`` is how many prompt tokens the caller's own prefill left in the KV.
     """
     if max_context < 0:
         raise ValueError("max_context must be nonnegative")
@@ -52,12 +37,8 @@ def generate(e, prompt, max_new, cache=None, stop=("<|im_end|>",), prepared_logi
         disabled_at = len(prompt)
     if cache is not None and e.nseq < 2:
         raise ValueError("DDC verification requires nseq >= 2")
-    # Which sequence holds the verification copy.  This used to be the literal 1
-    # everywhere below, which was only ever correct because the serial layout
-    # happened to put the scratch there; the archive now sits above it and the
-    # engine owns the index (eng.plan_sequences).  A stand-in object without the
-    # attribute keeps the old behaviour; a real engine that reserved no scratch
-    # has none to offer and is told so rather than corrupting a worker sequence.
+    # Which sequence holds the verification copy; the engine owns the index
+    # (eng.plan_sequences). A stand-in without the attribute defaults to 1.
     scratch = getattr(e, "ddc_seq", 1)
     if cache is not None:
         if scratch is None:
@@ -66,9 +47,9 @@ def generate(e, prompt, max_new, cache=None, stop=("<|im_end|>",), prepared_logi
             raise ValueError("DDC scratch sequence cannot be sequence 0")
     if max_new < 0 or not prompt:
         raise ValueError("Need a nonempty prompt and nonnegative token budget")
-    # The repetition detector's grace window is per generation, so it restarts
-    # here rather than only when the cache does -- a request that DDC skips
-    # entirely still has to not be judged on the previous request's content.
+    # The governor's grace window is per generation, so it restarts here even when
+    # the cache does: a request that skips DDC must not be judged on the last
+    # request's content.
     spec.begin_request()
     lib, mem = e.L, e.kmem
     stats = dict(tokens=0, calls=0, spec=0, full=0, acc1=0, accepted=0,
@@ -80,16 +61,15 @@ def generate(e, prompt, max_new, cache=None, stop=("<|im_end|>",), prepared_logi
                  cache_tokens_discarded=0, cache_tokens_at_start=0,
                  ddc_max_context=max_context, ddc_disabled_at=disabled_at)
     if prepared_logits is not None:
-        # Benchmark-only: caller restored an identical whole-state snapshot.
+        # Only valid when the caller restored an identical whole-state snapshot.
         if e.cur != prompt or e.kvlen() != len(prompt):
             raise ValueError("Prepared logits require the matching restored prefix")
         live = prepared_logits
         stats["reused"] = len(prompt)
     elif reuse is not None:
-        # The caller established the prefix -- through the archive, when one is
-        # on -- and forwarded the rest, so there is no prefill left to do here.
-        # Reading the logits is all that remains, and it is what synchronizes
-        # the pending forward pass, so it belongs in the prefill timing.
+        # The caller established the prefix and forwarded the rest, so only reading
+        # the logits remains; that read syncs the pending pass and counts as
+        # prefill time.
         started = time.perf_counter()
         live = np.ctypeslib.as_array(lib.llama_get_logits_ith(e.ctx, -1), shape=(e.nv,))
         stats.update(prefill_seconds=time.perf_counter()-started, reused=reuse)
@@ -99,9 +79,9 @@ def generate(e, prompt, max_new, cache=None, stop=("<|im_end|>",), prepared_logi
         if p < len(e.cur) and not e.trunc(p):
             p = 0
         e.feed(prompt[p:])
-        # Read the last output, also when the prompt already equals the current
-        # prefix and the preceding call left multiple verification outputs.
-        # The getter synchronizes pending work before timing prefill ends.
+        # Read the last output even when the prompt already equals the current
+        # prefix: the preceding call may have left multiple verification
+        # outputs. The getter also synchronizes the pending forward pass.
         live = np.ctypeslib.as_array(lib.llama_get_logits_ith(e.ctx, -1), shape=(e.nv,))
         stats.update(prefill_seconds=time.perf_counter()-started, reused=p)
     tokens, raw = [], bytearray()
@@ -129,33 +109,23 @@ def generate(e, prompt, max_new, cache=None, stop=("<|im_end|>",), prepared_logi
         cache.begin()  # Include deleting/rebuilding draft bookkeeping in timing.
         stats["cache_tokens_at_start"] = cache.size
     while len(tokens) < max_new and stopped is None:
-        # Per-round timing, so the governor has a plain-decoding reference even
-        # when no request ever bypasses DDC.  Without this the only sequential
-        # sample came from requests long enough to skip the cache, and a session
-        # whose prompts all sit below that threshold would never be judged at
-        # all -- leaving speculation on at 0.712x, which is the case this exists
-        # to catch.
+        # Per-round timing, so the governor has a plain-decoding reference even when
+        # no request ever bypasses DDC.
         round_started = time.perf_counter()
         pos = len(e.cur)
         if cache is not None and max_context and pos >= max_context:
             cache = None
             stats["ddc_disabled_at"] = pos
-        # Repetition detector.  If recent rounds were offered no draft -- or one
-        # or two tokens -- the content is not repeating, and every further round
-        # would pay the full-vocabulary feature scan for nothing.  Stand down
-        # BEFORE the scan rather than refusing the proposal after it: refusing
-        # later saves the verification but not the scan, which is the fixed cost.
-        # The statistics are global, so a workload that turns repetitive comes
-        # back on its own through the cooldown re-probe.
+        # Repetition detector. Stand down BEFORE the feature scan, not after:
+        # refusing later saves the verification but not the scan, which is the
+        # fixed cost. The statistics are global, so a workload that turns
+        # repetitive comes back on its own through the cooldown re-probe.
         if cache is not None and not spec.paying():
             cache = None
             stats["stood_down"] = stats.get("stood_down", 0) + 1
         nxt = int(live.argmax())
-        # Time the DDC-only work so the plain-decoding yardstick below can be
-        # charged for it.  Without this the no-draft round -- which ran describe()
-        # and propose() and then returned one token -- is reported as a clean
-        # plain sample and drags _seq down, making every bucket look better than
-        # it is and the gate more lenient than intended.
+        # Time the DDC-only work so the plain-decoding yardstick below is charged
+        # for it: a no-draft round still ran describe() and propose().
         overhead_started = time.perf_counter()
         first = describe(live) if cache is not None else None
         room = max_new-len(tokens)
@@ -163,20 +133,16 @@ def generate(e, prompt, max_new, cache=None, stop=("<|im_end|>",), prepared_logi
             room = min(room, max_context-pos)
         if cache is not None:
             proposal = cache.propose(first[0], nxt, room)
-            # Score the round by what it was offered, 0 included.  A round that
-            # found nothing is the one measurement the bucket gate never sees.
+            # Score the round by what it was offered, 0 included: a round that found
+            # nothing is the one measurement the bucket gate never sees.
             spec.note_offer(len(proposal.tokens) if proposal is not None else 0)
             overhead = time.perf_counter() - overhead_started
         else:
             proposal = None
             overhead = 0.0
-        # Per-round gate.  A round pays a verification pass over the whole draft
-        # and, unless it is accepted in full, a second pass to refeed -- so a
-        # short draft that is only partly accepted costs two forwards and
-        # returns about one token.  The gate refuses the draft lengths that have
-        # measured that way, and only those: the lengths that land keep their
-        # ~3x.  Refusing here turns the round into an ordinary decode step,
-        # which is also what supplies the plain rate the gate compares against.
+        # Per-round gate in spec.py: a partly accepted draft costs two forward
+        # passes for about one token, so the losing lengths are refused here,
+        # which also supplies the plain rate the gate compares against.
         if proposal is not None and not spec.allow(len(proposal.tokens)):
             stats["gated"] = stats.get("gated", 0) + 1
             proposal = None
@@ -233,8 +199,8 @@ def generate(e, prompt, max_new, cache=None, stop=("<|im_end|>",), prepared_logi
             stats["cross_spec"] += proposal.cross_request
             stats["cross_accepted"] += count if proposal.cross_request else 0
             if full:
-                # Only a full prefix can be moved with the hybrid memory API.
-                # This is the whole-state copy the long-context case pays for.
+                # Only a full prefix can be moved with the hybrid memory API: this is
+                # the whole-state copy the long-context case pays for.
                 t_swap = time.perf_counter()
                 lib.llama_memory_seq_rm(mem, 0, 0, -1)
                 lib.llama_memory_seq_cp(mem, scratch, 0, 0, -1)
@@ -249,8 +215,8 @@ def generate(e, prompt, max_new, cache=None, stop=("<|im_end|>",), prepared_logi
                 stats["refeed_seconds"] += time.perf_counter() - t_re
                 stats["refeed_positions"] += count
             e.cur.extend(accepted)
-            # Read committed-path features only, before another decode can
-            # overwrite the shared logits buffer. No rejected tail is indexed.
+            # Read committed-path features only, before another decode can overwrite
+            # the shared logits buffer. No rejected tail is indexed.
             descriptions = [first] + [describe(row(i)) for i in range(count-1)]
             live = row(count-1)
             if lib.llama_memory_seq_pos_max(mem, scratch) != -1:
@@ -260,17 +226,13 @@ def generate(e, prompt, max_new, cache=None, stop=("<|im_end|>",), prepared_logi
         if proposal is None:
             spec.note_sequential(1, round_seconds)
         else:
-            # Bucket by the length we took, credit what it returned.  That is the
-            # question the gate asks -- "when I take a draft this long, what do I
-            # get back" -- so a long draft that a stop string truncated to one
-            # token belongs in the long bucket, where it reads as the bad round
-            # it was.
+            # Bucket by the length taken, not by what a stop string trimmed back to:
+            # the gate asks what taking a draft this long returns.
             spec.note_round(len(draft), len(accepted), round_seconds)
         if e.kvlen() != len(e.cur):
             raise RuntimeError("Committed KV length disagrees with token history")
-        # Feed the repetition detector every committed token, indexed or not.
-        # It has to keep running while DDC is stood down, or it could never see
-        # the content turn repetitive and switch back on.
+        # Feed the repetition detector every committed token, indexed or not, so it
+        # keeps running while DDC is stood down.
         for token in accepted:
             spec.note_token(token)
         if cache is not None:

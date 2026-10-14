@@ -1,23 +1,12 @@
 # -*- coding: utf-8 -*-
 """Engine layer: KV, APC, logits cache, trajectory recall, turn-keyed reuse.
 
-Cache layers, cheapest first:
-  1)  logits cache   : prompt identical token for token -> replay with no forward
-                      pass and no KV work
-  1b) trajectory recall: prompt is a PREFIX of a recorded trajectory -> hand back
-                      the recorded continuation, again with no forward pass
-  1c) turn-keyed reuse: the trailing user turn was answered before in this same
-                      dialog -> replay (or edit) that reply; opt-in, see qcache
-  2)  APC            : longest common prefix -> only the new part is forwarded
-  3)  cold start     : full prefill
+Cache layers, cheapest first: logits cache, trajectory recall, turn-keyed reuse
+(CC_QREUSE), then APC (longest common prefix, only the new part is forwarded),
+then a cold full prefill.
 
-This model is hybrid (full attention plus recurrent layers).  The recurrent
-state is a running summary over 0..p and cannot be rewound, so a PARTIAL
-truncation via llama_memory_seq_rm is a no-op in practice (measured: truncating
-to 2500 still leaves kvlen at 3000).  trunc() therefore verifies after
-truncating and, when the truncation did not take, clears everything and makes
-the caller restart from position zero.  Correctness first: the price is paying
-for the whole context again.
+The model is hybrid, so a partial llama_memory_seq_rm truncation is a no-op;
+trunc() verifies it took and otherwise clears everything.
 """
 from __future__ import annotations
 
@@ -37,35 +26,18 @@ from lib import Mp, Cp, Msg, Batch, GGUF, Q4_0, bind
 
 
 def ddc_key():
-    """The CC_DDC setting in force, or None when the draft cache is off.
-
-    Off by default.  It was on by default until the archive became the default
-    instead: the archive is the layer that helps the shape this server actually
-    sees (agent fan-out), while a draft cache is a throughput knob that pays
-    only where the content repeats and changes the numerical path when it does.
-    See the draft-cache block in Eng.__init__.
-
-    This stays the place the default is decided, so that eng.plan_sequences and
-    Eng.__init__ cannot disagree about whether DDC is on -- they both call it.
-    """
+    """The CC_DDC setting in force, or None when the draft cache is off."""
     v = os.environ.get("CC_DDC")
     return v if (v and v != "0") else None
 
 
-# How much of a worker's window one archive slot is charged by default.  The
-# slot holds a state some request already prefilled, and the ones worth keeping
-# are divergence points, which are short -- see arc_cap_for.  Halving it is the
-# value that buys a second archive point for the VRAM the slot used to cost on
-# its own, which is the trade the archive was asked for; CC_ARCHIVE_CAP=0
-# restores the old full-window slot outright.
+# Tokens one archive slot is charged by default (see arc_cap_for);
+# CC_ARCHIVE_CAP=0 charges it a whole window instead.
 ARC_CAP_DIV = max(1, int(os.environ.get("CC_ARCHIVE_CAP_DIV", "2") or 2))
 
 
 def arc_slot_count() -> int:
-    """How many sequences the prefix archive asks to keep.  0 when it is off.
-
-    On by default; ``CC_ARCHIVE=0`` turns it off.
-    """
+    """Archive sequences to keep; 0 when off.  CC_ARCHIVE=0 turns it off."""
     v = os.environ.get("CC_ARCHIVE", "1").strip().lower()
     if v in ("0", "false", "off", "no"):
         return 0
@@ -73,30 +45,7 @@ def arc_slot_count() -> int:
 
 
 def arc_cap_for(window: int) -> int:
-    """The most tokens ONE archive slot may hold, given the worker window.
-
-    CC_ARCHIVE_CAP sets it outright; 0 there means NO cap, which charges an
-    archive slot a whole window exactly as the layout always did.  Unset, it
-    defaults to half the window -- see ARC_CAP_DIV.
-
-    Why an archive slot is worth charging less than a worker: the two hold
-    different things.  A worker sequence has to hold whatever prompt arrives and
-    is bounded by the window; an archive slot only ever holds a state that some
-    request already prefilled, and the states worth keeping are the DIVERGENCE
-    points, which are short.  Measured on the fan-out recordings, the prefix ten
-    sibling agents actually shared was 16406 tokens against a 131072 window, and
-    the archived boundaries ran 16k-42k.  Charging every slot a full window for
-    that is what kept CC_ARCHIVE_SLOTS at 1.
-
-    What the cap costs is the long boundaries: a state past it is not archived
-    at all (arc_ready declines it and arc_skip_cap counts it), so a request that
-    would have restored it prefills instead.  That is a reuse loss, never a
-    correctness loss -- nothing is truncated, the state simply is not kept.
-
-    Honoured only while CC_KV_UNIFIED is on -- without a unified pool llama.cpp
-    splits the cells evenly and a per-sequence cap is not expressible at all.
-    See arc_capped.
-    """
+    """The most tokens ONE archive slot may hold; CC_ARCHIVE_CAP=0 means no cap."""
     raw = os.environ.get("CC_ARCHIVE_CAP")
     if raw is None or not str(raw).strip():
         return max(1, max(1, window) // ARC_CAP_DIV)
@@ -104,14 +53,7 @@ def arc_cap_for(window: int) -> int:
 
 
 def arc_capped(window: int) -> bool:
-    """Whether archive slots are charged a capped budget instead of a window.
-
-    Three things have to hold.  Without CC_KV_UNIFIED the cells are split evenly,
-    so every sequence gets pool/nseq whether it uses it or not and a cap is not
-    expressible.  With no archive slots there is nothing to cap.  And a cap at or
-    above the window is the historical layout by another name, so it is reported
-    as uncapped rather than as a cap that happens to save nothing.
-    """
+    """Whether archive slots are charged a capped budget instead of a window."""
     if not kv_unified_default() or not arc_slot_count():
         return False
     cap = arc_cap_for(window)
@@ -119,25 +61,14 @@ def arc_capped(window: int) -> bool:
 
 
 def ddc_batch_pool() -> int:
-    """Scratch sequences for DDC inside the batched scheduler.
-
-    0 (off) unless CC_DDC_BATCH=1.  Unverified -- see Batcher's speculation
-    block -- so it stays opt-in rather than riding on CC_DDC's default.
-    """
+    """Scratch sequences for DDC in the batched scheduler; CC_DDC_BATCH=1 on."""
     if os.environ.get("CC_DDC_BATCH") != "1":
         return 0
     return max(0, int(os.environ.get("CC_DDC_BATCH_SCRATCH", "1")))
 
 
 def ddc_scratch_count(workers: int) -> int:
-    """How many sequences DDC needs of its own.
-
-    One, on the serial path.  Under CC_BATCH it is a small pool instead: the
-    scheduler serves several requests at once, and a verification needs its
-    scratch for the whole round, so a single one would let only one of them
-    speculate.  The pool is a bound on the KV reservation, not on correctness --
-    a job that cannot get a scratch decodes normally.
-    """
+    """How many sequences DDC needs of its own."""
     if ddc_key() is None:
         return 0
     if workers == 1:
@@ -148,21 +79,7 @@ def ddc_scratch_count(workers: int) -> int:
 def pool_for(window: int, workers: int) -> int:
     """The KV cells to reserve so ``workers`` sequences each keep ``window``.
 
-    One place decides this.  srv.py calls it (through plan_sequences) before the
-    context exists and Eng calls it again while constructing, and Eng recovers
-    the window from the pool with window_of, its exact inverse -- so a change
-    here cannot leave the two disagreeing about how large a request may be.
-
-    Uncapped this is the flat ``window x nseq`` it has always been: every
-    sequence, archive slots included, is charged the full window.  Capped it is
-
-        window x (workers + DDC scratch) + cap x archive slots
-
-    so the sequences that WORK keep the caller's whole window, while the ones
-    that only HOLD state are charged what they are allowed to hold.  Both terms
-    are in cells, and the unified pool is what lets them be added: llama.cpp
-    splits n_ctx evenly across n_seq_max unless kv_unified is set, and an uneven
-    split is exactly what this is.
+    Capped: ``window x (workers + DDC scratch) + cap x archive slots``.
     """
     work = max(1, workers + ddc_scratch_count(workers))
     arc = arc_slot_count()
@@ -174,22 +91,7 @@ def pool_for(window: int, workers: int) -> int:
 def window_of(pool: int, workers: int) -> int:
     """How many tokens ONE sequence may hold, given a pool from pool_for.
 
-    The exact inverse of pool_for, found by search rather than by rearranging it:
-    pool_for is monotone in the window, so the largest window it still fits in
-    ``pool`` IS the window that produced ``pool``.  Rearranging would be another
-    definition of the sizing to keep in step, and keeping two definitions in step
-    is the failure this whole block exists to avoid -- it is how DDC's scratch
-    once landed on the sequence the archive had already claimed.
-
-    This used to be the literal ``n_ctx // nseq`` at the point of use, which is
-    only right while the pool is nseq equal slices.  Capped it is not, and
-    dividing anyway UNDER-reports what a worker sequence can hold -- so requests
-    that fit get rejected, and the archive is blamed for a limit it did not
-    impose.
-
-    Values below pool_for(1, workers) -- a caller that passed a pool too small
-    for even two sequences -- come back as 1, which is the honest answer and
-    leaves the admission check to refuse the request.
+    The exact inverse of pool_for, found by search rather than by rearranging it.
     """
     lo, hi = 1, max(1, pool)
     while lo < hi:
@@ -202,13 +104,7 @@ def window_of(pool: int, workers: int) -> int:
 
 
 def pool_terms(window: int, workers: int) -> str:
-    """pool_for in words, for the startup line.
-
-    Kept beside it so the log and the arithmetic cannot describe two different
-    layouts -- the startup line is how the layout gets checked, and a hardcoded
-    description there would be a wrong answer to the question it exists to
-    answer.
-    """
+    """pool_for in words, for the startup line."""
     work = max(1, workers + ddc_scratch_count(workers))
     arc = arc_slot_count()
     if arc_capped(window):
@@ -219,32 +115,8 @@ def pool_terms(window: int, workers: int) -> str:
 def plan_sequences(n_ctx: int, workers: int) -> tuple[int, int, int | None]:
     """Decide the sequence budget, and with it the KV reservation.
 
-    Returns ``(nseq, n_ctx, ddc_seq)``: the sequence count, the cells to reserve,
-    and the first index DDC's verification scratch lives on (None when none is
-    reserved).
-
-    One layout rule, in index order::
-
-        0 .. workers-1                 work sequences
-        workers .. workers+scratch-1   DDC's verification scratch (or pool)
-        the last CC_ARCHIVE_SLOTS      archived whole states
-
-    The scratch is reserved only when DDC can actually run: on the serial path,
-    or under CC_BATCH when CC_DDC_BATCH turns the speculative scheduler on.
-
-    srv.py calls this before the context exists and Eng calls it again while
-    constructing; its outputs are pure functions of (workers, environment) -- the
-    n_ctx argument is the per-request WINDOW, and only scales the returned
-    reservation -- so the two calls cannot drift.  They used to be sized
-    separately -- srv.py owned the archive, Eng owned DDC's doubling -- which is
-    exactly how DDC's scratch ended up on the sequence the archive had already
-    claimed.
-
-    The second element is pool_for(n_ctx, workers), and it exceeds n_ctx because
-    llama.cpp divides its cells across n_seq_max: that multiplication is the
-    whole reason the combination costs memory rather than nothing.  The sizing
-    itself lives in pool_for rather than on the line below so that the capped
-    case -- where it is not a flat multiplication -- stays one definition.
+    -> ``(nseq, n_ctx, ddc_seq)``: sequence count, cells to reserve, and the
+    first index DDC's scratch lives on (None when none is reserved).
     """
     scratch = ddc_scratch_count(workers)
     nseq = max(1, workers + scratch + arc_slot_count())
@@ -252,22 +124,10 @@ def plan_sequences(n_ctx: int, workers: int) -> tuple[int, int, int | None]:
     return nseq, pool_for(n_ctx, workers), ddc_seq
 
 
-# Prompt-processing progress reporting.
-#
-# Why this exists rather than llama.cpp's own "Prompt processing progress: N%":
-# this engine prefills in chunks of at most `bs` tokens so that a long prompt
-# shares a step with requests that are already decoding (see Batcher._plan), and
-# the C-level message is emitted per n_batch forward pass with no notion of the
-# request it belongs to.  On a 117k-token prompt -- which this server really
-# sees, the measured maximum -- that is over 900 identical lines per request,
-# several of them interleaved from concurrent jobs.  It reports the engine's
-# granularity, not the caller's question, which is "how far along is MY prompt".
-#
-# So the percentage is computed here, from numbers the engine already has, and
-# emitted only when it actually moves by PROGRESS_STEP.  `total` is the whole
-# prefill this request PAYS FOR -- the forwarded part, since the reused prefix is
-# already in the KV and costs nothing -- so the first line of a cache-served
-# request starts wherever the real work starts.
+# Prompt-processing progress, reported per request rather than per
+# llama_decode call: the C-level progress line is emitted once per n_batch pass
+# with no notion of the request it belongs to.  `total` is the forwarded part --
+# the reused prefix is already in the KV and costs nothing.
 PROGRESS_STEP = float(os.environ.get("CC_PROGRESS_STEP", "10") or 10)
 
 
@@ -282,33 +142,16 @@ def progress_enabled() -> bool:
         return True
 
 
-# Batch sizes.  These were hardcoded at n_batch=512 / n_ubatch=128, which is the
-# conservative end of what llama.cpp accepts; LM Studio's defaults for the same
-# model on the same card are 2048 / 512, so the two servers were never a
-# like-for-like comparison.  They are read from the environment now so the pair
-# can be A/B'd without editing code.
-#
-# What the two do, and why they are NOT interchangeable:
-#
-#   n_batch   the LOGICAL batch: the most tokens one llama_decode may carry.
-#             Here it is also load-bearing in Python -- Batch._plan sizes each
-#             step's token budget from it, so raising it lets one step advance
-#             more sequences.  It does NOT size the prefill chunk: that was
-#             bs // 4 once, which on a fan-out is the shape that produced a
-#             measured p90 of 199 s, and it is capped at 128 independently now
-#             (see Batcher.__init__ / CC_BATCH_CHUNK).
-#             It costs almost no VRAM by itself.
-#
-#   n_ubatch  the PHYSICAL batch: what one GPU forward pass actually computes.
-#             This is the knob that moves prefill throughput, because it sets the
-#             real parallelism per pass.  When n_batch > n_ubatch, llama.cpp
-#             splits the logical batch into several forward passes, so raising
-#             n_batch alone buys nothing but shorter Python-side bookkeeping.
-#             It costs VRAM LINEARLY -- the compute buffer is n_ubatch x n_embd --
-#             which is the reason it is the one to watch for an OOM.
-#
-# n_ubatch > n_batch is rejected by llama.cpp, and n_ubatch <= 0 is clamped by
-# it, so both are validated here where the failure can name the setting.
+# Batch sizes, from the environment so the pair can be A/B'd without editing
+# code.  They are not interchangeable:
+#   n_batch   the LOGICAL batch: most tokens one llama_decode may carry.  Also
+#             load-bearing in Python (Batcher sizes each step from it), and it
+#             costs almost no VRAM.
+#   n_ubatch  the PHYSICAL batch: what one GPU forward pass computes, so it is
+#             the knob that moves prefill throughput.  It costs VRAM LINEARLY
+#             (n_ubatch x n_embd) and is the one to watch for an OOM.
+# n_ubatch > n_batch is rejected by llama.cpp and n_ubatch <= 0 is clamped, so
+# both are validated here where the failure can name the setting.
 def n_batch_default() -> int:
     """CC_N_BATCH, default 2048 (LM Studio's evaluation batch size)."""
     return _int_env("CC_N_BATCH", 2048, minimum=1)
@@ -320,54 +163,16 @@ def n_ubatch_default() -> int:
 
 
 def n_rs_seq_default() -> int:
-    """CC_N_RS_SEQ, default 0.  Recurrent-state snapshots per sequence.
-
-    llama.h calls it "number of recurrent-state snapshots per seq for rollback
-    (0 = no rollback) [EXPERIMENTAL]", and it is the library-level half of what
-    LM Studio's load panel lists as Context Checkpoints (32 there).  The other
-    half, --ctx-checkpoints, is llama-server SLOT machinery -- there is no field
-    for it in llama_context_params, so a caller that binds llama.dll directly
-    cannot reach it at all; cc_srv's equivalent is the prefix archive.
-
-    Snapshots should matter more on this model than on a dense one: 25 of its 33
-    blocks are SSM/Mamba, and a recurrent state is a running summary that cannot
-    be rewound.  That is why a partial llama_memory_seq_rm is a no-op here and
-    why truncation rebuilds instead of trimming.  Snapshots are precisely what
-    would make a rewind expressible.
-
-    Default 0 because it does not appear to be reachable from outside
-    speculative decoding in this build: measured at 0/1/2/4 with a small
-    context, a partial seq_rm returned false and the sequence length did not
-    move either way.  Turning it on costs memory per sequence per snapshot, so
-    it stays off until something shows it doing work.
-    """
+    """CC_N_RS_SEQ, default 0.  Recurrent-state snapshots per sequence (llama.h
+    calls it "for rollback, 0 = no rollback"); cc_srv's equivalent of LM Studio's
+    Context Checkpoints is the prefix archive."""
     return _int_env("CC_N_RS_SEQ", 0, minimum=0)
 
 
 def kv_unified_default() -> bool:
-    """CC_KV_UNIFIED, default on.  One KV pool shared by every sequence.
-
-    Off (llama.cpp's own default), the n_ctx cells are split evenly across
-    n_seq_max: each sequence owns a fixed slice and cannot borrow from another,
-    so a spare sequence costs a full slice whether or not it uses it.  That is
-    why this engine multiplies n_ctx by the sequence count -- it is buying a
-    full window for every sequence, archive slots included.
-
-    On, the sequences draw from one pool.  Measured on this model with
-    n_ctx=4096, n_seq_max=4: a single sequence could hold all 3000 tokens fed to
-    it with kv_unified on, and only 1024 with it off.
-
-    That changes what a spare sequence costs.  An archive slot that holds 21k
-    tokens of state no longer reserves a whole window to do it, so the number of
-    archive slots stops being bounded by VRAM the way it was.
-
-    It also changes what n_ctx means: it is the pool, not pool/nseq.  The pool is
-    sized by pool_for and the per-sequence bound is recovered from it by
-    window_of, its inverse -- dividing the pool by nseq is only right while every
-    sequence is charged the same, and with the archive capped (CC_ARCHIVE_CAP,
-    on by default) they are not.  Setting CC_ARCHIVE_CAP=0 restores the flat
-    ``window x nseq`` exactly, so the two can be compared without editing code.
-    """
+    """CC_KV_UNIFIED, default on.  One KV pool shared by every sequence, so a
+    spare sequence costs only what it holds; with it off llama.cpp splits n_ctx
+    into a fixed slice per sequence."""
     v = os.environ.get("CC_KV_UNIFIED", "1").strip().lower()
     return v not in ("0", "false", "off", "no")
 
@@ -386,20 +191,8 @@ def _int_env(name: str, default: int, minimum: int = 1) -> int:
 
 
 class Progress:
-    """Per-request prefill progress, reported in whole steps.
-
-    One instance per request, because the batched scheduler advances several
-    prefill cursors in the same step and a shared counter would credit one
-    request with its neighbours' tokens -- the same reason Job carries its own
-    pf_s/gn_s rather than reading the engine's global counters.
-
-    The percentage is of the tokens THIS request forwards, not of the prompt:
-    a request served from the cache forwards a few hundred of a 50k prompt and
-    should read as nearly done, not as 1%.
-
-    ``label`` is what makes concurrent jobs tellable apart in the log; it is the
-    sequence index the scheduler handed the job.
-    """
+    """Per-request prefill progress, reported in whole steps.  The percentage is
+    of the tokens THIS request forwards, not of the prompt."""
 
     __slots__ = ("total", "done", "next_at", "label", "log", "on", "started")
 
@@ -409,20 +202,12 @@ class Progress:
         self.label = label
         self.log = log
         self.on = bool(self.total) and progress_enabled() and PROGRESS_STEP > 0
-        # The threshold the NEXT line needs, as a percentage.  It is only ever
-        # compared against the live percentage: the number printed is always
-        # recomputed from self.done, so the percentage and the token counts on a
-        # line can never disagree.  (Printing the threshold itself instead was
-        # wrong the moment a chunk crossed several steps at once -- a bs-sized
-        # serial chunk emitted "10.0% (1000/1000 tok)".)
+        # The threshold the NEXT line needs.  Only ever compared against the live
+        # percentage: the number printed is recomputed from self.done, so the
+        # percentage and the token counts on a line cannot disagree.
         self.next_at = PROGRESS_STEP
-        # The 0% line is NOT emitted here.  A reporter is constructed when a job
-        # is ADMITTED, which under the batched scheduler can be well before the
-        # job is first advanced -- it may be waiting for a worker holding its
-        # history.  Printing at construction would leave a "0.0% ..." line
-        # sitting there while nothing happens, which reads like a stall.  The
-        # first line goes out on the first forward pass instead (see add), so
-        # every line corresponds to work that has actually begun.
+        # No 0% line here: a job is admitted well before it is first advanced.
+        # The first line goes out on the first forward pass instead (see add).
         self.started = False
 
     def _say(self):
@@ -433,40 +218,27 @@ class Progress:
         self.log(f"prefill {pct:5.1f}% ({self.done}/{self.total} tok{where})")
 
     def add(self, n: int):
-        """Account for ``n`` forwarded tokens, emitting at most one line.
-
-        At most one, not one per step crossed: the percentage printed is always
-        the live one, so several steps crossed by the same chunk would print the
-        SAME percentage and the same token counts several times over.  A chunk is
-        one forward pass, and one line per forward pass at the reader's chosen
-        granularity is what this is for.  ``next_at`` is still advanced past
-        every threshold the chunk cleared, so the next line reports the next step
-        that has genuinely not been shown yet.
-        """
+        """Account for ``n`` forwarded tokens, emitting at most one line."""
         if not self.on:
             return
         self.done += n
         pct = 100.0 * self.done / self.total
         if not self.started:
-            # First real work: report where it starts.  This is the line that
-            # makes a cache-served prefill visible at all, since forwarding 300
-            # of 50k tokens may never reach the first whole step.
+            # First real work: a cache-served prefill may never reach the first
+            # whole step, so this is the line that makes it visible at all.
             self.started = True
             self._say()
             while self.next_at < 100.0 and pct >= self.next_at:
                 self.next_at += PROGRESS_STEP
         elif pct >= self.next_at or self.done >= self.total:
             self._say()
-            # Advance past everything this chunk cleared.  A while loop rather
-            # than an assignment, because one chunk can clear several steps (the
-            # serial path forwards up to bs tokens per decode) and leaving
-            # next_at behind would make the next line repeat a stale threshold.
+            # Advance past every threshold this chunk cleared: one chunk can
+            # clear several, and a stale next_at would repeat a line.
             while self.next_at < 100.0 and pct >= self.next_at:
                 self.next_at += PROGRESS_STEP
         if self.done >= self.total:
-            # Done: `on` is cleared so a later add() (the batched path can call
-            # this again if a re-used sequence's cursor moves past the end) stays
-            # silent instead of printing 100% a second time.
+            # Clear `on` so a later add() stays silent instead of printing 100%
+            # a second time.
             self.on = False
 
 
@@ -474,30 +246,13 @@ def probe(e, pids: list[int], max_new: int, stop: list[str], stopk: tuple,
           turn=None, on_token=None, on_serve=None):
     """Try every layer that needs no KV work.  Returns gen()'s triple, or None.
 
-    These are the exact-prompt logits cache, trajectory recall, and the
-    turn-keyed reuse layer.  None of them forwards anything or touches the KV,
-    so they are cheap enough to run in front of a batched scheduler -- and doing
-    so is the point: a request served here never occupies a sequence, which
-    leaves the slots free for the requests that really do need a forward pass.
-
-    A module-level function rather than a method because the engine is duck-typed
-    in places (test_ddc drives Eng.gen with a stand-in object), and a stand-in
-    cannot be expected to grow a method for every refactor.
-
-    The order is deliberate: the two exact layers are sound, and the turn-keyed
-    layer is a semantic choice, so it goes last.
-
-    ``on_serve(reused, hit)`` is reported BEFORE ``on_token`` on every hit.  A
-    hit here reuses the whole prompt and then hands over the text in one call,
-    so reporting afterwards would have the text -- and with it message_start --
-    reach the client before the reuse was known, and the start frame is exactly
-    where the client reads the cache fields from.
+    on_serve(reused, hit) fires before on_token: the text carries message_start,
+    which is where the client reads the cache fields from.
     """
     st = e.st
     # 1) Whole prompt identical -> logits cache.  Entries store the TEXT and not
-    #    a re-decode of the tokens: stop-string trimming happens at the text
-    #    level, so rebuilding from tokens would emit the stop token again.  The
-    #    stop set has to be part of the key.
+    #    a re-decode of the tokens: stop trimming happens at the text level, so
+    #    the stop set has to be part of the key.
     entry = e.lgc.get(e.key(pids))
     if entry is not None and entry[3] == stopk:
         toks_, text_, trunc = entry[0], entry[1], entry[2]
@@ -514,8 +269,8 @@ def probe(e, pids: list[int], max_new: int, stop: list[str], stopk: tuple,
                 on_token(text)
             return toks, text, {"hit": "lgc", "pre": 0, "reuse": len(pids)}
 
-    # 2) Trajectory recall (a weaker requirement than 1: only that the prompt is
-    #    a prefix of some recorded trajectory).
+    # 2) Trajectory recall (weaker than 1: only that the prompt is a PREFIX of
+    #    some recorded trajectory).
     r = e.recall(pids, max_new, stop)
     if r is not None:
         if on_serve:
@@ -527,9 +282,8 @@ def probe(e, pids: list[int], max_new: int, stop: list[str], stopk: tuple,
     # 3) Turn-keyed reuse.
     qc = getattr(e, "qc", None)
     if qc is not None:
-        # A qreuse hit also answers with the whole prompt reused, but the layer
-        # decides that itself and calls on_token from inside -- so the report is
-        # wrapped onto that call rather than made after it returns.
+        # The layer calls on_token from inside, so the report is wrapped onto
+        # that call rather than made after it returns.
         served = []
 
         def _tok(chunk, _t=on_token):
@@ -556,125 +310,71 @@ class Eng:
         L = self.L = bind()
         if bs is None:
             bs = n_batch_default()
-        # None means "take the environment's answer", the same convention bs
-        # uses above; an explicit 0 still means 0 rather than falling through.
+        # None means "take the environment's answer", the convention bs uses
+        # above; an explicit 0 still means 0.
         if n_rs is None:
             n_rs = n_rs_seq_default()
 
         # The sequence layout is settled once, here, from the caller's numbers
-        # and the environment; every index below is read off it instead of being
-        # re-derived.  srv.py has already applied the same plan, so nseq normally
-        # arrives at the planned value and nothing below moves.
+        # and the environment; srv.py has already applied the same plan, so
+        # every index below reads off it instead of being re-derived.
         plan_nseq, _, self.ddc_seq = plan_sequences(n_ctx, workers)
         if nseq < plan_nseq:
-            # A direct caller (this module's own smoke test, a benchmark harness)
-            # asked for fewer sequences than the configuration needs.  It sized
-            # n_ctx for the sequences IT named, so the window it asked for is
-            # n_ctx // nseq, and the planned layout is charged that window: the
-            # reservation is the price of the layout, and paying it beats the old
-            # behaviour of quietly halving every sequence's window instead.
+            # A direct caller asked for fewer sequences than the layout needs;
+            # it sized n_ctx for the ones it named, so charge the layout that
+            # window.
             n_ctx = pool_for(max(1, n_ctx // max(1, nseq)), workers)
             nseq = plan_nseq
 
-        # The KV cells are n_ctx in total and llama.cpp divides them across
-        # n_seq_max sequences, so this is how many tokens ONE sequence can hold.
-        # Past it llama_decode fails, and a failed decode leaves the sequences in
-        # that batch holding tokens the ledger does not know about, so the next
-        # admission computes its reusable prefix from stale data and decodes from
-        # the wrong position.  Everything that has to stay inside the window
-        # reads it from here rather than recomputing the division.
-        #
-        # Settled here, immediately after n_ctx and nseq are, because everything
-        # below -- DDC's own context limit, the archive's slot budget, the log
-        # lines -- is defined in terms of it.  It reads window_of rather than
-        # n_ctx // nseq: under a capped archive the pool is not nseq equal
-        # slices, and the division would under-report what a WORKER sequence can
-        # hold.  The two agree exactly whenever no cap is set.
+        # The tokens ONE sequence can hold; llama_decode fails past it and a
+        # failed decode leaves the ledger stale.  Read from window_of rather
+        # than n_ctx // nseq: under a capped archive the pool is not nseq equal
+        # slices, and the division under-reports what a worker can hold.
         self.window = window_of(n_ctx, workers)
 
-        # The sequences DDC may verify on.  On the serial path this is the single
-        # scratch ddc_decode copies into (and ddc_seq is its index); under
-        # CC_DDC_BATCH the scheduler claims one per speculative round from the
-        # same list, so the two paths can never disagree about which sequences
-        # are DDC's.
+        # The sequences DDC may verify on (see plan_sequences).
         self.ddc_pool: list = list(range(workers,
                                           workers + ddc_scratch_count(workers)))
 
-        # DDC draft cache (experimental, off by default; data in DDC_EXPERIMENT.md).
-        # Key = top-k token ranking of the current logits -- what is read out is
-        # decided by the direction alone (oscillation_subspace.tex: cell
-        # membership decides the readout, a cosine test does not work), so equal
-        # top-1 means the same readout cell; that is a discrete predicate, not an
-        # approximate cosine.  Value = the continuation tokens of a past
-        # trajectory plus a per-position margin (the margin only decides where a
-        # draft is cut, never whether it is right).  Every draft still has to be
-        # verified by the target model in a batch: the approximate key is a
-        # throughput knob, correctness does not rest on it.
+        # DDC draft cache (off by default).  Key = top-k token ranking of the
+        # current logits; equal top-1 means the same readout cell.  Value = a
+        # past trajectory's continuation plus a per-position margin.  Every
+        # draft is still verified by the target model, so the key is a
+        # throughput knob and correctness does not rest on it.
         # Verification needs a second sequence, so KV reservation doubles with
         # nseq.
         self.ddc = None
         self.ddc_max_ctx = 0          # set below, once the window is known
-        # Off by default.  Turned on it is the draft cache that makes a long
-        # agentic turn cheap, and what keeps it honest is the per-round gate in
-        # spec.py: it drops any draft length that stops paying, and stands the
-        # whole thing down on content that is not repeating.
-        #   unset       off
-        #   CC_DDC=0    off
-        #   CC_DDC=2|4  on, with that n-gram key width
-        #
-        # k=4 is the recommended width because that is the configuration the
-        # draft lengths were measured in: k4 + M=32 + T=0.5 gave 15-22 tokens per
-        # round against 6-13 for the older k2/M=16/T=1.0.  k=2 was what the live
-        # CC session had been run with, and the two were never separated in a
-        # clean sweep.
-        #
-        # The prefix archive used to keep its states in the same spare
-        # sequences, and the pair was refused rather than letting the two
-        # silently overwrite each other.  They no longer overlap: DDC's
-        # verification scratch gets a sequence of its own and the archive sits
-        # above it (see plan_sequences), so naming both serves both.
+        # Off by default; CC_DDC=2|4 turns it on with that n-gram key width.
+        # What keeps it honest is the per-round gate in spec.py, which drops any
+        # draft length that stops paying.
         _k = ddc_key()
         if _k is not None:
             from ddc import DraftCache
             _k = int(_k)
             if _k not in (2, 4):
                 raise RuntimeError(f"CC_DDC supports only 0, 2 or 4, got {_k!r}")
-            # Aggressive draft settings on purpose.  Measured on real CC
-            # traffic the round's rate rises monotonically with draft length
-            # (27 tok/s at 2-3 tokens, 84 at 4-7, 96 at 8-15, 160 at 16+), so
-            # long drafts are what pays -- and the per-round gate in spec.py
-            # drops any bucket that turns out not to, which is what makes it
-            # safe to aim long by default instead of guessing a threshold.
+            # Aggressive draft settings on purpose: the round's rate rises with
+            # draft length, and the per-round gate in spec.py drops any bucket
+            # that turns out not to pay.
             self.ddc = DraftCache(k=_k,
                                   max_draft=int(os.environ.get("CC_DDC_M", "32")),
                                   threshold=float(os.environ.get("CC_DDC_T", "0.5")),
                                   gate=float(os.environ.get("CC_DDC_GATE", "0.")),
                                   reset_per_request=os.environ.get("CC_DDC_RESET") == "1")
             if self.ddc_seq is None:
-                # DDC is on but no scratch sequence was reserved, which under
-                # this layout means a batcher is serving every request.  Saying
-                # so once is worth more than the silence: the DDC counters and
-                # the spec.py governor would otherwise just never move.
+                # DDC is on but no scratch sequence was reserved, so the batched
+                # scheduler is serving every request and nothing will speculate.
                 log("CC_DDC is on but the batched scheduler serves every request "
                     "and DDC runs on the serial path only -- no scratch sequence "
                     "reserved, so no speculation will happen (unset CC_BATCH to "
                     "use DDC)")
-            # Default the cutoff to this sequence's own window, so it never
-            # stands DDC down early; it remains only as the clamp that stops a
-            # draft running past the end of the context.
-            #
-            # What decides whether speculation pays is the accept rate, not the
-            # length.  A round that lands its whole draft is ~3x faster than
-            # decoding one token at a time; a round that lands a fraction of it
-            # pays two forward passes for about one token.  The gates in spec.py
-            # measure that directly, so a static length threshold would be both a
-            # poor proxy and redundant.  The whole-state copy does scale with
-            # length, but it is second-order: ~129 MB at 14k tokens, so ~1.3 ms a
-            # copy at 64k against ~15 ms for a decoded token.
+            # Default the cutoff to this sequence's own window, so it never stands DDC
+            # down early; it remains the clamp that stops a draft running past the
+            # end of the context.
             _mctx = os.environ.get("CC_DDC_MAX_CTX")
-            # self.window, not n_ctx // nseq: the two are the same number only
-            # while every sequence is charged a full window, and DDC's limit has
-            # to be the length a sequence can actually hold either way.
+            # self.window, not n_ctx // nseq: DDC's limit has to be a length a
+            # sequence can actually hold either way.
             self.ddc_max_ctx = self.window if _mctx is None else int(_mctx)
             if self.ddc_max_ctx < 0:
                 raise ValueError("CC_DDC_MAX_CTX must be >= 0 (0 means unlimited)")
@@ -685,11 +385,9 @@ class Eng:
                 f"(scratch={self.ddc_seq if self.ddc_seq is not None else 'none'}, "
                 f"nseq={nseq}, n_ctx={n_ctx})")
 
-        # Turn-keyed reuse (experimental, off by default; see qcache.py and
-        # USAGE.md).  Unlike the exact-prompt cache this one fires when the same
-        # user turn comes back inside a running dialog, which is the only shape
-        # in which the exact cache can never fire: the prompt grows every turn,
-        # so it is never byte-identical to an earlier one.
+        # Turn-keyed reuse (off by default; see qcache.py).  Unlike the exact-prompt
+        # cache it fires when the same user turn comes back inside a running
+        # dialog, the only shape in which the exact cache can never fire.
         self.qc = None
         _q = int(os.environ.get("CC_QREUSE", "0") or 0)
         if _q:
@@ -703,44 +401,27 @@ class Eng:
             log(f"turn-keyed reuse on level={_q} edit={self.qc.edit} "
                 f"topk={self.qc.topk} sim={self.qc.sim} skip_tool={self.qc.skip_tool}")
 
-        # Prefix archive (on by default; CC_ARCHIVE=0 turns it off.  See USAGE.md
-        # 6.4).
-        # The engine keeps one KV, and a request that is shorter than it -- or
-        # that diverges before its end -- needs a truncation, which this hybrid
-        # memory cannot do.  That is what drops prefix capture from ~0.85 in a
-        # linear dialog to ~0.06 under agent fan-out: siblings of the same parent
-        # share a long prefix but are not extensions of each other.
-        #
-        # The archive stores whole states at the points where requests have
-        # actually diverged, in spare sequences, and restores one wholesale with
-        # seq_cp when a later request asks for it.  Whole-sequence copies are the
-        # operation that does work here (measured; see snap/fork below).
+        # Prefix archive (on by default; CC_ARCHIVE=0 turns it off).
+        # Whole states are copied aside with seq_cp at the divergence points,
+        # because the truncation a shorter or diverging request would need is a
+        # no-op on this memory.
         self.arc = None
         self.arc_slots: list = []
         self.arc_min = int(os.environ.get("CC_ARCHIVE_MIN", "512"))
         # The longest state an archive slot may hold, in tokens; 0 means the slot
-        # is charged a whole window and anything that fits the window fits it.
-        # Derived from self.window, which is settled above, and read once here so
-        # arc_ready and arc_put cannot disagree about the bound while a request
-        # is in flight.
+        # is charged a whole window.  Read once here so arc_ready and arc_put
+        # cannot disagree while a request is in flight.
         self.arc_cap = arc_cap_for(self.window)
-        # Which sequences a batched scheduler may use for work: the first
-        # ``workers`` of them and no others.  Derived here rather than left as
-        # range(nseq), because under the current layout nseq counts the archive
-        # slots and DDC's scratch as well, and handing a scheduler one of those
-        # would overwrite an archived state or DDC's verification copy mid-round.
+        # Sequences a batched scheduler may use for work: the first ``workers``
+        # and no others.  Derived rather than range(nseq), because nseq counts
+        # the archive slots and DDC's scratch too.
         self.work_seqs: list = list(range(workers))
         want = arc_slot_count()
         if want:
             self.arc = {}
             self.arc_clock = 1
-            # The top of the range, above the workers and above DDC's scratch.
-            # That is what makes the arithmetic safe: the layout reserves the
-            # scratch BELOW the archive, so "nseq - want" can only ever land on
-            # an archive slot.  Reading it off the layout instead of recomputing
-            # workers+scratch here is deliberate -- recomputing is how the index
-            # that used to be DDC's scratch came to be handed out as an archive
-            # slot, which is the overlap this pairing was refused for.
+            # The top of the range, above the workers and DDC's scratch, so
+            # "nseq - want" can only ever land on an archive slot.
             self.arc_slots = list(range(nseq - want, nseq))
             log(f"prefix archive on, slots {self.arc_slots}, "
                 f"worker sequences {self.work_seqs}, "
@@ -758,16 +439,16 @@ class Eng:
         cp = L.llama_context_default_params()
         ub = n_ubatch_default()
         if ub > bs:
-            # llama.cpp asserts rather than recovering from this, and the abort
-            # names nothing, so it is caught here where the settings are known.
+            # llama.cpp aborts on this rather than recovering, so it is caught
+            # here where the settings are known.
             raise ValueError(
                 f"CC_N_UBATCH ({ub}) must not exceed the logical batch "
                 f"CC_N_BATCH ({bs}); the physical batch is a subdivision of the "
                 f"logical one, so a larger value has nothing to subdivide")
         cp.n_ctx = n_ctx; cp.n_batch = bs; cp.n_ubatch = ub
         cp.n_seq_max = nseq; cp.n_rs_seq = n_rs
-        # One KV pool for every sequence instead of a fixed slice each.  What
-        # that buys, and why it matters for the archive, is on kv_unified_default.
+        # One KV pool for every sequence instead of a fixed slice each; see
+        # kv_unified_default.
         cp.kvu = kv_unified_default()
         cp.tk = Q4_0; cp.tv = Q4_0          # quantized KV; 9216 B/position x n_ctx, paid once at context creation
         self.ctx = L.llama_init_from_model(self.mdl, cp)
@@ -777,15 +458,13 @@ class Eng:
         self.nv = L.llama_vocab_n_tokens(self.vcb)
         self.kmem = L.llama_get_memory(self.ctx)   # not named mem: mem() below is the memory report and would collide
         self.bs = bs
-        # Kept so the startup line can report the pair that was actually applied
-        # rather than the defaults, which is the only way a user can tell whether
-        # their CC_N_UBATCH took effect.
+        # Kept so the startup line can report the pair that was actually applied.
         self.ub = ub
         self.kvu = bool(cp.kvu)
 
         # The prefill progress reporter in force, or None.  Only ever set around
-        # a prefill (see gen/feed_prefix): feed() is shared with the decode path,
-        # where a prompt percentage would be meaningless.
+        # a prefill: feed() is shared with the decode path, where a prompt
+        # percentage would be meaningless.
         self.prog = None
 
         self.cur: list[int] = []                   # the token sequence the KV currently holds
@@ -795,67 +474,50 @@ class Eng:
         # attention, exact and needing no verification:
         #   the running sequence R is a prefix of a recorded trajectory T
         #   <=>  T[len(R)] is the token the model would produce next
-        # (the token at position i is decided by 0..i-1 alone, so equal prefixes
-        # imply equal outputs).  This covers rewind, fork, cutting in at any
-        # position, and converging back onto a recorded trajectory mid-generation.
+        # (the token at position i is decided by 0..i-1 alone).
         self.ridx: dict = {}                       # (prefix length, digest) -> (trajectory id, position)
         self.rgen: dict = {}                       # trajectory id -> (gen_ids, text, stopk)
         self.ridx_max = 200_000                    # FIFO eviction; a broken chain only loses a recall, it never recalls wrongly
-        # Kept for reference only.  reg() used to index just the first rcap
-        # positions of a trajectory while rgen held the whole reply, so a recall
-        # starting early in a long reply ran out of index and handed back a
-        # fragment as if it were the finished answer -- a cache hit that ended
-        # the dialog mid-sentence.  Everything generated is indexed now; the
-        # bound that matters is ridx_max.
+        # Kept for reference only: reg() indexes the whole reply, so the bound
+        # that matters is ridx_max.
         self.rcap = 256
         self.tid = 0
         self.ng = {}; self.ng_done = 0; self.ng_keep = None
         # Fork archives.  Nothing calls snap()/fork() today, and they are NOT
-        # layout-aware: they cycle 1..nseq-1, which now includes DDC's scratch
-        # and the archive slots.  Whoever wires them up has to start the cycle
-        # above plan_sequences' reservations first.
+        # layout-aware: they cycle 1..nseq-1, so whoever wires them up has to
+        # start the cycle above plan_sequences' reservations.
         self.nseq = nseq; self.snaps = {}; self.slot = 1
         self.seq = []; self.ng_k = 6                        # used by prompt lookup
         # What each sequence's KV holds, as far as the scheduler's ledger knows.
-        # Only the batched path uses this; the single-sequence path keeps the
-        # one sequence it owns in self.cur.
         self.seq_tokens: dict = {}
 
         self.st = {"req": 0, "apc": 0, "lgc": 0, "rcl": 0, "pre": 0, "reuse": 0,
                    "gen": 0, "t_pre": 0.0, "t_gen": 0.0,
-                   # rcl_short counts recalls that were DECLINED because the chain
-                   # broke before the end of the trajectory.  Declining is correct
-                   # (the alternative is a fragment served as a finished reply),
-                   # but it means the layer stopped paying, so it is counted
-                   # rather than silent.
+                   # rcl_short counts recalls DECLINED because the
+                   # chain broke before the end of the trajectory.
                    "rcl_short": 0,
                    "ddc_req": 0, "ddc_spec": 0, "ddc_full": 0, "ddc_acc1": 0,
                    "ddc_tok": 0, "ddc_bypass": 0, "ddc_cutoff": 0,
                    "ddc_gated": 0, "ddc_stood_down": 0, "ddc_feature_s": 0.0,
                    "qhit": 0, "qsaved": 0, "qedit": 0, "qtopk_s": 0.0, "qstore": 0,
                    "arc_put": 0, "arc_hit": 0, "arc_restore": 0,
-                   # Boundaries the cap refused to archive.  Counted because it
-                   # is the one way CC_ARCHIVE_CAP costs reuse, and a cap that is
-                   # biting otherwise looks the same as an archive with nothing
-                   # worth keeping -- see arc_ready.
+                   # Boundaries the cap refused to archive: the one way
+                   # CC_ARCHIVE_CAP costs reuse -- see arc_ready.
                    "arc_skip_cap": 0,
                    "arc_s": 0.0, "arc_tok": 0}
 
         self._turn_mark = self.tok("<|im_start|>user")
-        # What must precede a REAL turn marker.  Derived, not hardcoded: the
-        # last token of a lone newline is the newline token whatever this
-        # vocabulary happens to call it.  An empty result disables the anchor,
-        # which puts the behaviour back to the unanchored search rather than
-        # silently finding no boundaries at all.
+        # What must precede a REAL turn marker.  Derived, not hardcoded: the last
+        # token of a lone newline is the newline token whatever this vocabulary
+        # calls it.  An empty result disables the anchor, which puts the search
+        # back to its unanchored form.
         _nl = self.tok("\n")
         self._turn_pre = {_nl[-1]} if _nl else set()
         tb = ct.create_string_buffer(1 << 17)
         n = L.llama_model_meta_val_str(self.mdl, b"tokenizer.chat_template", tb, len(tb))
         self.tpl = tb.raw[:n].decode("utf-8") if n > 0 else None
-        # The model's own Jinja template, compiled, so that reading it and
-        # executing it stop being different things.  See chat_template.py for why
-        # llama_chat_apply_template was not executing it, and for the one thing
-        # the template gets wrong that this engine has to work around.
+        # The model's own Jinja template, compiled; see chat_template.py for why
+        # llama_chat_apply_template is not used instead.
         _tmpl_mode = template_mode()
         self.ct = ChatTemplate(self.tpl if _tmpl_mode else None, log,
                                why=None if _tmpl_mode else
@@ -866,19 +528,10 @@ class Eng:
             f"tpl={'yes, ' + str(len(self.tpl)) + ' chars' if self.tpl else 'none'} "
             f"n_batch={bs} n_ubatch={ub} kv_unified={self.kvu}")
         log(f"chat template: {self.ct.line()}")
-        # The same settings again, in the terms LM Studio's load panel uses, so
-        # that "cc_srv runs what LM Studio runs" is a line the startup log can be
-        # checked against rather than a claim to be taken on trust.  Every value
-        # is read off the params struct that was actually handed to the context,
-        # never off a table -- llama.cpp moved use_mmap/use_mlock into
-        # load_mode/lazy_mode and dropped those fields entirely, and a hardcoded
-        # description would still be naming them.
-        #
-        # Which rows of that panel have no counterpart here is stated rather than
-        # hidden: Context Checkpoints is --ctx-checkpoints, a llama-server SLOT
-        # option with no field in llama_context_params, and the nearest thing
-        # cc_srv has to it is the prefix archive.  load_mode/lazy_mode -1/1 are
-        # AUTO, which is what "try mmap" and "keep model in memory" ask for.
+        # The same settings in LM Studio's load-panel terms, read off the params
+        # struct actually handed to the context.  Context Checkpoints is
+        # --ctx-checkpoints, a llama-server SLOT option with no field in
+        # llama_context_params; the nearest thing here is the prefix archive.
         log(f"load settings: n_batch={bs} n_ubatch={ub} n_seq_max={nseq} "
             f"kv_unified={self.kvu} n_rs_seq={n_rs} "
             f"offload_kqv={bool(cp.okq)} op_offload={bool(cp.oo)} "
@@ -890,13 +543,8 @@ class Eng:
                    thinking: bool | None = None):
         """The template's own render, or None if it would not produce one.
 
-        Separate from tmpl() on purpose.  tmpl() falls back to the library
-        renderer, which is right when a caller only wants "some prompt", and
-        wrong for prepare(): the two renderers end the prompt differently -- the
-        library path appends the reasoning block, a bare library render does not
-        -- so a caller that cannot tell which one it got cannot tell what it is
-        generating from.  Measured: 18521 identical tokens and then a two-token
-        difference in the head.
+        Separate from tmpl(): a caller that cannot tell which renderer it got
+        cannot tell what it is generating from.
         """
         if self.ct_mode == 0:
             return None
@@ -909,46 +557,28 @@ class Eng:
              thinking: bool | None = None) -> str:
         """[(role, content)] -> one string, flattened by the model's own template.
 
-        Three modes, from CC_TMPL (see chat_template.py):
-
-          0  llama_chat_apply_template, which does not run Jinja at all and
-             silently falls back to ChatML -- so the system message this model's
-             template injects never appears.
-          1  the template's leading system block, then THIS engine's rendering of
-             the conversation from the first user turn on.  The block is the part
-             the engine cannot produce for itself; the bodies are the part the
-             template gets wrong for this memory, because it re-renders a
-             finished assistant turn without the empty reasoning block it
-             generated from, and a prompt that diverges anywhere has to be
-             rebuilt from zero here.
-          2  the template does everything.  Kept as the reference for what the
-             template does unassisted; measured to cost the whole cache.
-
-        The splice in mode 1 is why the order matters: taking the block and
-        leaving the bodies keeps every byte a previous turn ended on exactly
-        where it was, so the prompt still EXTENDS the sequence and reuse still
-        happens.
+        Three modes, from CC_TMPL: 0 llama_chat_apply_template, 1 the template's
+        leading system block plus this engine's rendering of the conversation,
+        2 the template alone.  See chat_template.py.
         """
         if self.ct_mode == 2:
             got = self.ct.render(msgs, add_ass, thinking)
             return got if got is not None else self.tmpl_lib(msgs, add_ass)
         if self.ct_mode == 1:
             # The first message that is not a system message.  msgs_of emits at
-            # most one system message and always first, so this is 0 or 1 -- but
-            # it is computed rather than assumed, because a caller that puts the
-            # system block anywhere else would otherwise get it rendered twice.
+            # most one system message and always first, so this is 0 or 1 --
+            # computed rather than assumed, or a system block placed elsewhere
+            # would be rendered twice.
             k = next((i for i, (r, _) in enumerate(msgs) if r != "system"), len(msgs))
             head = self.ct.system_block(msgs, thinking)
             if head is not None:
                 body = self.tmpl_lib(msgs[k:], add_ass=False)
                 if not add_ass:
                     return head + body
-                # The generation header also comes from the template, and it has
-                # to: enable_thinking is the only thing that distinguishes the
-                # closed empty reasoning block from an open one, and the library
-                # renderer cannot be told about a template variable at all.  Ask
-                # for it the same way as everything else here -- render and take
-                # the difference -- rather than writing the two spans out.
+                # The generation header comes from the template too:
+                # enable_thinking is what separates the closed empty reasoning
+                # block from an open one, and the library renderer cannot be
+                # told about a template variable at all.
                 tail = self.ct.generation_head(msgs, thinking)
                 if tail is not None:
                     return head + body + tail
@@ -979,18 +609,10 @@ class Eng:
         return list(buf[:got])
 
     def piece(self, t: int) -> bytes:
-        """One token's BYTES.  Not text, and deliberately not named like it.
-
-        A token is a byte string: on this vocabulary a 4-byte emoji is three
-        tokens whose bytes are individually invalid UTF-8.  Decoding one token on
-        its own turns that character into U+FFFD somewhere it cannot be
-        recovered, so this returns bytes and every caller decides where the
-        decode happens -- ``utext`` for text, and once for a whole run.
-
-        The size is a retry rather than a hardcoded 64: llama_token_to_piece
-        returns the NEGATIVE of the length it needed, and slicing ``raw[:n]``
-        with that negative value would silently hand back all but the last n
-        bytes.  ddc_decode.py had the guard; this did not.
+        """One token's BYTES.  Not text, and deliberately not named like it: a token is
+        a byte string, so decoding one on its own would corrupt a character that
+        spans several of them.  The size is a retry because
+        llama_token_to_piece returns the NEGATIVE of the length it needed.
         """
         b = ct.create_string_buffer(64)
         n = self.L.llama_token_to_piece(self.vcb, t, b, 64, 0, True)
@@ -1009,12 +631,10 @@ class Eng:
         L = self.L
         chunk = chunk or self.bs
         raw = bytes((ct.c_int32 * len(ids))(*ids))
-        # Prefill progress, when a prefill established one (see Progress).  The
-        # hook lives here rather than in the callers because this loop is the
-        # only place that knows a chunk has actually been forwarded -- reporting
-        # on entry would claim progress before the work it describes.  During
-        # generation `prog` is None and nothing is emitted: a decode step is one
-        # token, and a percentage of a prompt says nothing about it.
+        # Prefill progress, when a prefill established one.  The hook lives
+        # here because this loop is the only place that knows a chunk was
+        # actually forwarded; during generation `prog` is None and nothing is
+        # emitted.
         prog = self.prog
         i = 0
         while i < len(ids):
@@ -1036,12 +656,9 @@ class Eng:
     def trunc(self, n: int) -> bool:
         """Truncate to the first n tokens; returns whether it REALLY happened.
 
-        Measured: seq_rm(mem,0,n,-1) for 0 < n < current length is a complete
-        no-op on this hybrid memory (the recurrent state cannot be rewound), not
-        an intermittent failure.  So the truncation is verified afterwards, and
-        when it did not take we clear everything -- the full clear (seq_rm to 0)
-        is reliable and verified.  Returning False tells the caller to restart
-        from position zero.
+        Partial truncation is a no-op on this hybrid memory; verify it took, and
+        when it did not clear everything (the full clear is reliable) and tell the
+        caller to restart from position zero.
         """
         if n >= len(self.cur):
             return True
@@ -1066,25 +683,16 @@ class Eng:
         parent differ only in their own trailing turn, so everything before it
         is common and the state there is what they all want.  Divergence from
         whatever a worker happens to hold is NOT that boundary -- in a fan-out
-        the workers hold unrelated branches, so that measure is small and the
-        archive never learns where the shared part ends.  Measured: with the
-        wrong boundary the archive stayed empty and capture fell below the plain
-        single-sequence server.
+        the workers hold unrelated branches, so that measure is small.
 
         Found by searching for the template's own turn marker rather than
-        assuming a layout; this file is already specific to one template (the
-        stop strings, the assistant header), and a sentinel here would have to
-        reproduce the template's tokenization to be worth anything.
+        assuming a layout; a sentinel here would have to reproduce the
+        template's tokenization to be worth anything.
 
-        The marker has to be ANCHORED, and that is not a refinement -- the
-        unanchored search is wrong on this project's own source.  eng.py contains
-        the line ``self._turn_mark = self.tok("<|im_start|>user")``, so a prompt
-        that includes eng.py contains the marker as ordinary text, and the search
-        returns that occurrence instead of the turn it was looking for.  Measured
-        on a real agent run reading src/: the boundary came back at token 16016 --
-        the first assistant turn -- for every request, so the archive stored and
-        restored one state at 16016 over and over while the prompt grew to 24000,
-        and every request re-forwarded everything after it.
+        The marker has to be ANCHORED, and that is not a refinement: eng.py
+        contains the line ``self._turn_mark = self.tok("user")``, so a prompt
+        that includes eng.py contains the marker as ordinary text and an
+        unanchored search returns that occurrence instead of the turn.
 
         A real turn marker follows a newline.  The occurrence inside source code
         follows a quote.  That is the whole test, and it is derived from the
@@ -1121,24 +729,14 @@ class Eng:
     def topk(self, k: int):
         """Top-k ids and logits at the current position, plus the baseline cost.
 
-        Timing this honestly takes care, and the same subtlety applies to every
-        measurement taken around the logits buffer:
+        Reading the logits is what forces the wait for the forward pass that
+        produced them, and the wait lands in whichever call first touches the
+        buffer: np.ctypeslib.as_array looks free and is a view, but it
+        dereferences the pointer, so it is usually the call that pays.
 
-        * Reading the logits is what forces the wait for the forward pass that
-          produced them, and the wait lands in whichever call first touches the
-          buffer.  np.ctypeslib.as_array looks free and is a view, but it
-          dereferences the pointer, so it is usually the call that pays.  Measured
-          inside the real loop: 13.9 ms in as_array, 0.02 ms in argmax, 1.3 ms in
-          argpartition.  A stopwatch around topk alone would therefore report the
-          decode as trace overhead.
-        * top() already scans the same buffer with argmax.
-
-        So as_array and the argmax are timed together and returned as ``base`` --
-        exactly what the trace-free path pays anyway -- and the caller subtracts
-        it.  What is left is the real marginal cost of keeping a trace: measured
-        on this box at 1.37 ms per token, against 20 ms per token of decode, so
-        about +8% and not +60%.  An A/B on one engine, alternating the two paths,
-        agrees: 20.2 ms/token without the trace, 21.9 with it.
+        as_array and the argmax are therefore timed together and returned as
+        ``base`` -- exactly what the trace-free path pays anyway -- and the
+        caller subtracts it.  What is left is the marginal cost of the trace.
         """
         t = time.perf_counter()
         lg = np.ctypeslib.as_array(self.L.llama_get_logits_ith(self.ctx, -1),
@@ -1150,26 +748,14 @@ class Eng:
         return idx.astype(np.int32), lg[idx].astype(np.float32), base
 
     # ---------------- inference-time speculation over the context ----------------
-    # Mechanism: at some generation step, take the last k tokens of the current
-    # sequence, look up their previous occurrence in the context already seen,
-    # and use the m tokens that followed it as a draft.  The context itself is
-    # the cache -- no extra model, no training.  The longer the context and the
-    # more self-similar it is (an agent repeating the same tool calls, quoting
-    # the same code), the higher the hit rate.
+    # Take the last k tokens of the current sequence, look up their previous
+    # occurrence in the context already seen, and draft the m tokens that
+    # followed it.  The context is the cache: no extra model, no training.
     #
-    # The hard part is verification: every draft has to be checked position by
-    # position, and this hybrid model cannot rewind (the recurrent state is a
-    # summary over 0..p).  So the draft never enters the real sequence; it is
-    # copied into seq1 and verified there:
-    #   seq_cp(0->1) copies the prefix  ->  feed the m draft tokens into seq1 in
-    #   one batch, read per-position logits  ->  compare position by position to
-    #   get the accepted count p  ->  seq_cp(1->0, [L, L+p)) moves the accepted
-    #   ones back into the real sequence (a memcpy, not a forward pass)
-    #   ->  seq_rm(seq1, 0, -1) clears the scratch sequence outright (this does
-    #   not touch seq0's last position, which is allowed)
-    # The real sequence only ever moves forward and never needs rewinding.
-    # Measured: all three primitives work, and batch per-position logits agree
-    # with step-by-step decode position for position (12/12).
+    # Verification is the hard part, and this model cannot rewind, so the draft
+    # never enters the real sequence -- it is copied into seq1 and verified
+    # there, then the accepted prefix is seq_cp'd back.  The real sequence only
+    # ever moves forward.
     def batch_parts(self, parts):
         """One batch built from tokens belonging to several sequences.
 
@@ -1178,10 +764,8 @@ class Eng:
         of one request next to a single decode step of another.
 
         Logits are requested only for the LAST token of each part, unless the
-        part sets ``all_rows``.  A caller needs one row per sequence -- the
-        next-token distribution -- and asking for every position would cost a
-        vocabulary-sized row per token for nothing.  Speculative verification is
-        the exception and the reason the flag exists.
+        part sets ``all_rows`` (speculative verification is the reason that
+        flag exists; a plain part wants only the next-token distribution).
 
         Returns ``(batch, keep, idx, first)`` where ``idx[k]`` and ``first[k]``
         are the BATCH POSITIONS of part k's last and first tokens.
@@ -1440,21 +1024,12 @@ class Eng:
         return g[0][k], "ridx"
 
     # ---------------- forking: archive + restore ----------------
-    # A hybrid model cannot rewind (the recurrent state is a running summary over
-    # 0..p), so partial truncation via seq_rm is a no-op, and forking back means
-    # clearing everything and recomputing (measured: 6178 tokens ~ 2.5 s).
-    #
-    # The way around it is NOT to rewind but to archive just before each fork
-    # point: at the moment a trajectory passes the fork point, the KV is exactly
-    # [0, fork point) -- copy the whole sequence aside at that instant.  To fork:
-    # clear the working sequence, restore the archive wholesale, and go a
-    # different way.
-    #
-    # All four primitives measured (functional check, not a position ledger):
-    #   seq_cp over a partial range -> no, llama.cpp asserts GGML_ASSERT(is_full) and aborts
-    #   seq_cp over the whole thing -> faithful (identical to a clean run, position by position)
-    #   snapshot after the source sequence advanced -> still valid
-    #   archive -> clear -> restore -> equivalent to a clean run
+    # A hybrid model cannot rewind, so partial truncation via seq_rm is a no-op
+    # and forking back means clearing and recomputing.  Instead, archive just
+    # before each fork point -- at the moment a trajectory passes it the KV is
+    # exactly [0, fork point) -- then to fork, clear the working sequence and
+    # restore the archive wholesale.  Whole-sequence copies are the only
+    # operation that works here; a partial seq_cp aborts on GGML_ASSERT(is_full).
     def snap(self, tag: str) -> int:
         """Store the whole current KV in a slot.  Returns the token length at the archive point."""
         if self.nseq < 2:
@@ -1483,35 +1058,24 @@ class Eng:
         return True
 
     # ---------------- prefix archive ----------------
-    # One KV, many branches.  A request that is shorter than the KV, or that
-    # diverges before its end, needs a truncation -- and a partial truncation on
-    # this hybrid memory is a no-op, so the whole context is rebuilt.  Under
-    # agent fan-out that is the normal case rather than the exception: sibling
-    # subagents share a long prefix but are not extensions of one another, so
-    # lcp(prompt, cur) lands short of the KV's end every time and every sibling
-    # re-prefills from zero.
+    # One KV, many branches.  A request shorter than the KV, or one that diverges
+    # before its end, needs a truncation -- which is a no-op on this hybrid
+    # memory, so the whole context is rebuilt.  Under agent fan-out that is the
+    # normal case: sibling subagents share a long prefix but are not extensions
+    # of one another.
     #
-    # The state a sibling needs is the one at the divergence point, and the only
-    # moment that state exists is while prefilling through it.  So arc_put is
-    # called on the way past that boundary, and a later sibling calls arc_restore
-    # to get it back whole.  Both use the whole-sequence copies that were
-    # measured to work here; no partial operation is involved.
+    # The state a sibling needs is the one at the divergence point, and it only
+    # exists while prefilling through it.  So arc_put is called on the way past
+    # that boundary and a later sibling calls arc_restore to get it back whole.
     def arc_ready(self, upto: int) -> bool:
         """Whether the boundary at ``upto`` is worth archiving."""
         if self.arc is None or upto < self.arc_min:
             return False
-        # A state longer than the slot's budget must not be copied into it: with
-        # a capped archive the slot's cells are only CC_ARCHIVE_CAP long, and a
-        # whole-state seq_cp of something longer would take cells the pool has
-        # promised to a worker -- exactly the overrun the unified-pool sizing
-        # exists to prevent, and llama.cpp aborts the decode rather than
-        # recovering from it.
-        #
-        # Counted, not just declined.  This is the one way the cap can cost
-        # reuse, so leaving it silent would make a cap that is biting look
-        # exactly like an archive with nothing worth keeping -- and the two call
-        # for opposite fixes.  A rising arc_skip_cap against a low arc_put means
-        # raise CC_ARCHIVE_CAP; arc_put high with reuse low means the archive's
+        # A state longer than the slot's budget must not be copied into it: with a
+        # capped archive the slot's cells are only CC_ARCHIVE_CAP long, and the
+        # seq_cp would take cells the pool promised to a worker.  Counted, not
+        # just declined: a rising arc_skip_cap against a low arc_put means raise
+        # CC_ARCHIVE_CAP; arc_put high with reuse low means the archive's
         # matching, not its size, is the problem.
         if 0 < self.arc_cap < upto:
             self.st["arc_skip_cap"] = self.st.get("arc_skip_cap", 0) + 1
@@ -1521,29 +1085,19 @@ class Eng:
     def arc_put(self, tokens, src: int = 0) -> None:
         """Store sequence ``src``'s KV, which holds exactly ``tokens``, in a spare slot.
 
-        ``src`` is a parameter because the batched scheduler does not keep its
-        work on sequence 0 -- each request has its own sequence -- so "the
-        current state" is whatever sequence the caller is holding, not a fixed
-        one.
-
-        A slot is reused by least-recent use when they are all taken.  The host
-        keeps the token sequence alongside the state because that sequence is the
-        only thing a later request can be matched against.
+        ``src`` is a parameter because the batched scheduler keeps each request
+        on its own sequence.  A slot is reused by least-recent use when they are
+        all taken; the host keeps the token sequence alongside the state because
+        that is what a later request is matched against.
         """
         if not self.arc_slots:
             return
         if 0 < self.arc_cap < len(tokens):
-            # arc_ready cleared this boundary, but the state that exists to store
-            # is the one the sequence holds NOW, and a chunk that straddled the
-            # boundary left it up to a batch past it.  That state cannot be
-            # shortened to fit -- the copy is whole-sequence and a partial
-            # operation is the truncation that does not work on this memory -- so
-            # the boundary is dropped rather than the slot overrunning its
-            # budget and taking cells the pool promised to a worker.
-            #
-            # Counted here as well as in arc_ready so the drop is never silent:
-            # a missed hit costs one prefill, but an unexplained one costs the
-            # next hour.
+            # arc_ready cleared this boundary, but the state that exists to store is
+            # the one the sequence holds NOW, and a chunk that straddled it left
+            # the state up to a batch past it.  It cannot be shortened to fit --
+            # the copy is whole-sequence -- so the boundary is dropped rather
+            # than the slot overrunning its budget.
             self.st["arc_skip_cap"] = self.st.get("arc_skip_cap", 0) + 1
             return
         free = [s for s in self.arc_slots if s not in self.arc]
@@ -1553,7 +1107,7 @@ class Eng:
             slot = min(self.arc, key=lambda s: self.arc[s][2])
         L = self.L
         L.llama_memory_seq_rm(self.kmem, slot, 0, -1)        # clear it first
-        L.llama_memory_seq_cp(self.kmem, src, slot, 0, -1)   # whole state, verified faithful
+        L.llama_memory_seq_cp(self.kmem, src, slot, 0, -1)   # whole state
         self.arc[slot] = (array("i", tokens), len(tokens), self.arc_clock)
         self.arc_clock += 1
         self.st["arc_put"] = self.st.get("arc_put", 0) + 1
@@ -1561,12 +1115,9 @@ class Eng:
     def arc_find(self, pids: list):
         """Longest archived state whose token sequence is a prefix of ``pids``.
 
-        Returns ``(slot, length)`` or ``None``.  The stored sequence must be a
-        prefix in full: a state at length n can only be restored and extended, it
-        cannot be shortened, because shortening is the truncation that does not
-        work.  Matching is an exact token comparison, not a heuristic -- a slot
-        whose tokens differ from the prompt at any position is not a candidate at
-        all.
+        Returns ``(slot, length)`` or ``None``.  The match must be a prefix in full:
+        a state at length n can only be restored and extended, not shortened.
+        Matching is an exact token comparison, not a heuristic.
         """
         if not self.arc:
             return None
@@ -1586,10 +1137,8 @@ class Eng:
         the request, and only the single-sequence path uses sequence 0.
         """
         toks, n, clock = self.arc[slot]
-        # Timed because a restore is the one cost this layer adds, and the whole
-        # question of whether a low-reuse hit is worth taking turns on it.  It is
-        # a whole-state seq_cp, so it scales with the state: n x 9216 B.  Measured
-        # so the answer comes from the counter rather than from an estimate.
+        # Timed because a restore is the one cost this layer adds: a whole-state
+        # seq_cp, so it scales with the state (n x 9216 B).
         t0 = time.perf_counter()
         self.L.llama_memory_seq_rm(self.kmem, dst, 0, -1)      # clear the target
         self.L.llama_memory_seq_cp(self.kmem, slot, dst, 0, -1)  # restore wholesale
@@ -1607,8 +1156,7 @@ class Eng:
         """Draft from the context itself: find the last k tokens in seq and take
         the m tokens that followed that occurrence.
 
-        Free -- no extra model, no training.  Measured: with k=6 m=16, 13.83
-        tokens are right in a row on average.
+        Free -- no extra model, no training.
         """
         if os.environ.get("PL_NODRAFT"):
             return None
@@ -1620,10 +1168,8 @@ class Eng:
         lst = self.ng.get(key)
         if not lst:
             return None
-        # Must try backwards one by one: lst[-1] may be too close (j+m past the
-        # current position), in which case fall back to an earlier occurrence.
-        # Taking only lst[-1] and giving up throws away most usable drafts
-        # (measured: the number of draft rounds halves).
+        # Walk the occurrences backwards: lst[-1] may be too close (j+m past the
+        # current position), in which case fall back to an earlier one.
         n = len(seq)
         for j in reversed(lst):
             if j + m <= n:
@@ -1725,9 +1271,7 @@ class Eng:
                                  None if d is None else len(d)))
             # The draft's key is "the last k tokens of the sequence", so d[0] is
             # already supposed to equal nxt; if it does not, the draft starts in
-            # the wrong place and is treated as absent.  (An earlier version
-            # pushed another nxt on top, duplicating it; verification then broke
-            # at position 1 and acceptance was always exactly 1.)
+            # the wrong place and is treated as absent.
             if d is None or d[0] != nxt:
                 self.feed([nxt]); self.seq.append(nxt)
                 self.ng_add(len(self.seq))
@@ -1809,14 +1353,10 @@ class Eng:
     def key(self, ids: list[int]) -> tuple:
         """(length, 128-bit digest).
 
-        The key used to be tuple(ids) -- a tuple of the whole prompt's tokens.
-        tracemalloc measured 2.11 MB for a single key at a 61k context (0.47 for
-        the tuple plus 1.63 for the int objects), while the generation result it
-        guards is only ~0.2 KB -- the key was 99.99% of the entry, and 512
-        entries came to 1.06 GB.  That is why keeping logits resident did not
-        previously pay (it was not much cheaper than the KV itself).  With a
-        digest it is 112 B per entry.  Collisions: at 128 bits, a noticeable
-        probability needs 2^64 entries resident at once, and the length is part
+        The key is a digest rather than tuple(ids): a tuple of the whole prompt's
+        tokens is ~99 % of the entry it guards, and 512 of them come to about a
+        GB.  With a digest it is 112 B per entry.  At 128 bits a noticeable
+        collision needs 2^64 entries resident at once, and the length is part
         of the key, so different lengths never collide.
         """
         h = hashlib.blake2b(digest_size=16)
@@ -1989,18 +1529,11 @@ class Eng:
         self.st["qsaved"] += len(toks)
         self.st["qedit"] += int(bool(info.get("edited")))
         # A reused reply is deliberately NOT registered into the recall index.
-        #
         # recall's guarantee is that a registered trajectory is one the model
-        # actually produced, so that equal prefixes imply equal continuations.  A
-        # reused reply was produced under `entry.prompt`, which is a strict prefix
-        # of this prompt -- so by construction it is not the continuation of this
-        # prompt.  Registering it would put a semantically chosen reply into the
-        # layer that is supposed to be exact, and because recall is consulted
-        # before this one, every later request served from that entry would bypass
-        # all the gates that live here (budget, recency, the tool-result refusal).
-        # The cost of not registering is nil in a normal dialog: the next turn's
-        # prompt is longer than this trajectory, so recall could not have fired
-        # for it anyway.
+        # actually produced, and a reused reply was produced under
+        # ``entry.prompt``, a strict prefix of this one -- registering it would
+        # put a semantically chosen reply into the layer that is meant to be
+        # exact, and later requests served from it would bypass the gates here.
         if on_token:
             on_token(text)
         out = {"hit": "qreuse", "pre": 0, "reuse": len(pids), "stop": None,
@@ -2010,14 +1543,10 @@ class Eng:
         return toks, text, out
 
     # ---------------- prefill, shared by the plain and DDC serving paths ----------------
-    # These two are the APC/archive half of gen(), lifted out so that gen_ddc()
-    # can run the same prefill.  The pair has to stay in step with itself: which
-    # prefix is used (plan_prefix) decides what feed_prefix may skip, and the
-    # archive put in feed_prefix depends on the divergence point plan_prefix
-    # reported.  It also has to be the SAME code in both serving paths, because
-    # the archive is only ever populated on the way past a divergence point --
-    # with DDC on, a prefill that skipped the put would leave the archive
-    # permanently empty and every restore a miss.
+    # The APC/archive half of gen(), lifted out so gen_ddc() can run the same
+    # prefill.  The pair must stay in step: the prefix plan_prefix chose decides
+    # what feed_prefix may skip, and the archive put in feed_prefix depends on
+    # the divergence point plan_prefix reported.
     def plan_prefix(self, pids: list[int], arc) -> tuple[int, int]:
         """Decide how much of ``pids`` the KV can hold.  -> (p, p_raw).
 
@@ -2103,17 +1632,10 @@ class Eng:
         # 1d) DDC (when CC_DDC is on): rank fingerprint looks up past
         #     trajectories -> draft -> target-model batch verification.
         #
-        #     Gated on the governor, because speculation is not always a win: on
-        #     long-context CC traffic it measured 0.712x, slower than decoding one
-        #     token at a time.  A static length threshold cannot see that -- the
-        #     acceptance rate is what decides it.  Requests that reach here and
-        #     skip DDC are also where the governor measures the plain decoding
-        #     rate, so both sides of the comparison are measured, not assumed.
-        #     The decision of whether any GIVEN round is worth taking belongs to
-        #     the governor inside ddc_decode, per draft length: speculation is
-        #     ~3x faster when a draft lands and a net loss when it does not, so
-        #     switching it off wholesale would throw away the wins with the
-        #     losses.  See spec.py.
+        #     Whether a given round is worth taking is decided by the governor
+        #     inside ddc_decode, per draft length: a round that lands is several
+        #     times faster than decoding one token at a time and one that does
+        #     not is a net loss, so it cannot be switched off wholesale.
         if self.ddc is not None:
             if not self.ddc_max_ctx or len(pids) < self.ddc_max_ctx:
                 return self.gen_ddc(pids, max_new, stop, on_token, stopk, on_serve)
@@ -2264,14 +1786,9 @@ class Eng:
         from ddc_decode import generate as _ddc_gen
         st = self.st
         # The prefill runs HERE rather than inside ddc_decode, so that the archive
-        # takes part in it.  A restore is only available at this level -- it is a
-        # whole-state copy onto the sequence the decoder is about to use, which is
-        # the one thing ddc_decode does not own -- and the put on the way past a
-        # divergence point is the only thing that ever fills the archive at all.
-        # Since DDC is the default serving path, a prefill that skipped the put
-        # would leave the archive permanently empty and make every restore miss.
-        # The decoder is told what the KV already holds (``reuse``) instead of
-        # working it out for itself from lcp/trunc.
+        # takes part in it: the put on the way past a divergence point is the
+        # only thing that ever fills the archive.  The decoder is told what the
+        # KV already holds (``reuse``) instead of working it out from lcp/trunc.
         arc = getattr(self, "arc", None)
         p, p_raw = self.plan_prefix(pids, arc)
         if on_serve is not None:

@@ -1,37 +1,11 @@
 # -*- coding: utf-8 -*-
 """Turn-keyed reuse of an earlier reply, optionally replayed from cached logits.
 
-Why this exists
----------------
-``Eng.lgc`` keys on the whole prompt, so it only fires when a request repeats
-byte for byte.  Inside a Claude Code dialog that almost never happens: every new
-turn appends the previous exchange, so the exact-prompt cache only pays off when
-a whole conversation is replayed.  The key here is instead the *trailing user
-turn*, which is what actually identifies "the same question".
+``Eng.lgc`` keys on the whole prompt, which almost never repeats inside a Claude
+Code dialog; the key here is the trailing user turn, the same question.
 
-Switch 1 -- ``CC_QREUSE``
-    0   off (the server behaves as before)
-    1   reuse when the same turn is asked again inside the same dialog, i.e. the
-        cached prompt is a prefix of the incoming prompt
-    2   also reuse across dialogs and for merely *similar* turns
-
-Switch 2 -- ``CC_QEDIT``
-    Keeps a top-k trace of the logits behind every generated token, replays that
-    trace through argmax, and lets a server-side edit rewrite the reply.  The
-    replay needs no forward pass, so the replayed tokens cost nothing to emit.
-    Level-2 reuse requires this switch: a similar question cannot be answered by
-    copying the old text, only by editing it.
-
-What this is not
-----------------
-Reuse is a semantic choice, not a correctness proof.  The reply is genuinely the
-model's, but it was produced under the context that was current when the
-question was first asked; nothing here re-derives it under the new context.
-Substitutions are validated against the cached top-k, which bounds how far a
-replacement may drift from what the model had in distribution.  Deletions,
-insertions, and the tail of a replacement that grew have no cached row to answer
-to and are written unchecked; see _validate.  None of this is a guarantee that
-the result equals a fresh generation, and the two are not claimed equal.
+CC_QREUSE   0 off, 1 the same turn again in the same dialog, 2 also similar turns
+CC_QEDIT    replay the cached top-k trace and rewrite the reply; needs CC_QREUSE=2
 """
 from __future__ import annotations
 
@@ -43,38 +17,24 @@ import numpy as np
 
 import utext
 
-# Replayed tokens are emitted by argmax over the stored row, so a stored trace
-# reproduces exactly the tokens it was recorded from.  The width only bounds
-# which edits count as "in distribution" for the model at that position.
+# Replaying is argmax over the stored row, so a trace reproduces its own tokens;
+# the width only bounds which edits count as in-distribution.
 DEFAULT_TOPK = 16
 
-# Claude Code injects volatile reminders into the user turn -- the attribution
-# block, the environment block.  They are not part of the question, and they
-# differ between the first ask and a repeat, so leaving them in the key would
-# stop the same question from ever matching itself.
+# Claude Code injects volatile <system-reminder> blocks into the user turn; they
+# differ between a first ask and a repeat, so leaving them in the key would stop
+# a question from ever matching itself.
 _REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
 
-# A tool result can be tens of thousands of tokens.  The digest covers all of
-# it; only this much text is kept, and only so that a level-2 similarity test
-# has something bounded to compare.
+# Only this much turn text is kept, so the level-2 similarity test stays bounded.
 QTEXT_MAX = 2000
 
 
 def turn_key(msgs: list) -> tuple | None:
-    """Key identifying the trailing user turn of a request.
+    """Key of the trailing user turn as ``(kind, digest, text)``; None if there is none.
 
-    ``msgs`` is the flattened ``[(role, content)]`` list the renderer builds.
-    Returns ``(kind, digest, text)`` or ``None`` when the request carries no
-    user turn at all.
-
-    The scan walks *backwards* past any trailing non-user turn.  In a real
-    Claude Code request the array ends with a ``role: system`` message holding
-    ``<total_tokens>N tokens left</total_tokens>``, so the last message is
-    almost never the question; keying on ``msgs[-1]`` would never match.
-
-    The trailing turn is used rather than the whole message list because the
-    list grows every turn by construction, while the question is what the user
-    repeats.
+    Scans backwards past trailing non-user turns: a Claude Code request ends with a
+    ``role: system`` token count, so ``msgs[-1]`` is almost never the question.
     """
     for role, content in reversed(msgs):
         if role != "user" or not content:
@@ -94,10 +54,9 @@ def _chunks(s: str) -> list:
 
 
 def substitutions(old: str, new: str, min_chars: int = 2) -> list:
-    """Word-level span substitutions that turn ``old`` into ``new``.
+    """The ``[(old_span, new_span)]`` substitutions turning ``old`` into ``new``.
 
-    Returns ``[(old_span, new_span)]``.  Pure insertions are dropped: they have
-    no anchor inside the old reply, so there is nothing to rewrite in place.
+    Pure insertions are dropped: they have no anchor in the old reply to rewrite.
     """
     a, b = _chunks(old), _chunks(new)
     out = []
@@ -113,11 +72,7 @@ def substitutions(old: str, new: str, min_chars: int = 2) -> list:
 
 
 def apply_substitutions(text: str, subs: list) -> tuple:
-    """Rewrite ``text`` in place; returns ``(edited, applied, skipped)``.
-
-    Spans are applied longest-first so that a short span cannot pre-empt a
-    longer, more specific one that contains it.
-    """
+    """Rewrite ``text`` in place; returns ``(edited, applied, skipped)``, longest span first."""
     edited = text
     applied = []
     for old, new in sorted(subs, key=lambda p: -len(p[0])):
@@ -131,9 +86,8 @@ def apply_substitutions(text: str, subs: list) -> tuple:
 def _trim(text: str, stopk) -> str:
     """Cut text at the earliest stop marker.
 
-    Needed whenever text is rebuilt from a token stream: a reply that ended on
-    its own carries the stop token, while the stored text was already trimmed at
-    the text level, so a naive rebuild puts the marker back.
+    Needed when text is rebuilt from tokens: a reply that ended on its own carries
+    the stop token, which the stored text had already had trimmed off.
     """
     cut = len(text)
     for sp in (stopk or ()):
@@ -151,10 +105,8 @@ def similarity(a: str, b: str) -> float:
 class Trace:
     """Top-k logits behind each generated token, one row per token.
 
-    A row is ``(ids, logits)`` sorted by descending logit, or ``None`` for a
-    position whose logits were never captured (a token served from the exact
-    cache rather than computed).  ``None`` rows are replayed verbatim and cannot
-    validate an edit.
+    A row is ``(ids, logits)`` descending, or ``None`` where the logits were not
+    captured; ``None`` rows replay verbatim and cannot validate an edit.
     """
 
     __slots__ = ("rows",)
@@ -188,13 +140,7 @@ class Trace:
         return int(row[0][int(np.argmax(row[1]))])
 
     def replay(self, tokens: list) -> list:
-        """Emit the stored token sequence through argmax of each stored row.
-
-        Rows reproduce their own top-1 by construction, so this is an identity
-        on an unedited trace; it exists so that an edit has somewhere to be
-        applied and so that a trace/​token mismatch is detected rather than
-        silently copied.
-        """
+        """Emit the stored token sequence through each row's argmax; an identity on an unedited trace."""
         out = []
         for i, token in enumerate(tokens):
             chosen = self.argmax(i)
@@ -213,20 +159,12 @@ class Entry:
         self.qkey, self.qtext, self.kind = qkey, qtext, kind
         self.pkey, self.plen = pkey, plen
         self.toks, self.text, self.stopk = toks, text, stopk
-        # ``trunc`` means the recorded reply ran into the token budget rather
-        # than ending on its own.  Only then may it be shortened to a smaller
-        # budget: a naturally finished reply has no stop token inside ``text``
-        # precisely because the trimming happened at the text level, so
-        # re-deriving its text from tokens would put the stop marker back.
+        # ``trunc``: the reply ran into the token budget rather than ending on
+        # its own, and only then may it be shortened to a smaller budget.
         self.trunc = trunc
         self.trace = trace
-        # Whether the recorded reply contains a tool call.  This is what makes
-        # reusing a reply to a TOOL RESULT safe or not: replay it, and if the
-        # reply itself calls a tool, Claude Code runs that tool, gets the same
-        # result, asks the same trailing turn again -- and the cache answers
-        # again.  The prompt keeps growing so the prefix test keeps passing and
-        # the loop never breaks on its own.  A reply with no tool call in it has
-        # no such edge.
+        # Whether the reply contains a tool call: replaying one that does
+        # re-issues the call that produced the tool result, and the dialog loops.
         self.has_call = has_call
 
 
@@ -243,9 +181,9 @@ class Match:
 class QCache:
     """Turn-keyed store of earlier replies.
 
-    ``level`` 1 requires the cached prompt to be a prefix of the incoming prompt
-    -- the same dialog, continued.  ``level`` 2 additionally accepts a similar
-    turn from any dialog, which is only sound together with the edit path.
+    ``level`` 1 requires the cached prompt to be a prefix of the incoming one;
+    ``level`` 2 additionally accepts a similar turn from any dialog, which needs
+    the edit path.
     """
 
     def __init__(self, level: int = 0, edit: bool = False, topk: int = DEFAULT_TOPK,
@@ -257,10 +195,8 @@ class QCache:
         if not 0.0 < sim <= 1.0:
             raise ValueError("CC_QEDIT_SIM must be in (0, 1]")
         self.level, self.edit, self.topk = level, edit, topk
-        # Reusing the reply to a *tool result* is how a dialog starts repeating
-        # itself: the cached reply usually contains the very tool call that
-        # produced the result, so replaying it re-issues that call.  Off by
-        # default; CC_QREUSE_TOOL=1 allows it.
+        # Reusing a reply to a tool result re-issues the very call that produced it,
+        # which is how a dialog starts repeating itself; CC_QREUSE_TOOL=1 opts in.
         self.skip_tool = skip_tool
         self.sim, self.capacity = sim, capacity
         self.clear()
@@ -278,8 +214,7 @@ class QCache:
               has_call=False):
         """Record a reply.  ``key`` is a :func:`turn_key` result.
 
-        Prompts are not retained in full: only the digest needed to check the
-        prefix relation, plus the turn text used for similarity.
+        Prompts are not retained: only the digest for the prefix test and the text.
         """
         if key is None or not toks:
             return
@@ -303,9 +238,8 @@ class QCache:
     def match(self, key, prompt, stopk, max_new):
         """Find a reusable entry for this request, or ``None``.
 
-        A candidate is only usable when its stop set matches and it produced
-        enough tokens to satisfy the caller's budget; otherwise the reply would
-        be truncated relative to what was asked for.
+        A candidate is only usable when its stop set matches and it produced enough
+        tokens to satisfy the caller's budget.
         """
         if self.level == 0 or key is None:
             return None
@@ -316,8 +250,8 @@ class QCache:
         best = None
         for entry in reversed(self.entries.get(digest, ())):
             if entry.kind == "tool" and entry.has_call:
-                # Allowed past the skip_tool gate, but this specific reply calls
-                # a tool -- replaying it is the loop described on Entry.
+                # Past the skip_tool gate, but this reply itself calls a tool, so replaying
+                # it is the loop noted on Entry.
                 self.st["loop_risk"] += 1
                 continue
             if entry.kind == kind and self._usable(entry, prompt, stopk, max_new):
@@ -339,8 +273,7 @@ class QCache:
         if not self._budget_ok(entry, max_new):
             return False
         if entry.plen == len(prompt):
-            # Byte-identical prompt: that is the exact-prompt logits cache's job,
-            # not this layer's, and the caller has already tried it.
+            # A byte-identical prompt is the exact-prompt logits cache's job, not this layer's.
             return False
         # The same dialog, continued: the recorded prompt must be a prefix.
         return _prompt_key(prompt[:entry.plen]) == entry.pkey
@@ -349,34 +282,16 @@ class QCache:
     def _budget_ok(entry, max_new: int) -> bool:
         """Whether a recorded reply can answer a request with this token budget.
 
-        A reply that ended on its own fits any budget: max_new is a cap, and a
-        reply shorter than the cap is ordinary.  One that ran into its budget is
-        different -- its ending was never produced, so reusing it hands back a
-        reply that stops mid-thought.  That is only acceptable when the caller
-        allows no more than was recorded, which is also the only case in which
-        realize() can shorten the token stream to fit.
+        A reply cut off by its budget never produced its ending, so it is only
+        reusable where the caller wants no more than was recorded.
         """
         return (not entry.trunc) or max_new <= len(entry.toks)
 
     def _fuzzy(self, key, prompt, stopk, max_new):
         """Level 2: a similar turn from any dialog, if the edit path is on.
 
-        Two gates, and both were tightened after measuring a real dialog rather
-        than by reasoning about one:
-
-        * The similarity floor.  Claude Code questions are long and share a lot
-          of boilerplate ("Read src/... and list the ..."), so two genuinely
-          different questions score around 0.65.  At the original floor of 0.6
-          this fired on 10 of the 18 requests of a live dialog, answering one
-          question with a copy of the answer to another, and the dialog
-          degenerated.  The floor now defaults to 0.9.
-        * The edit must be non-empty.  Level 2 exists to *rewrite* a reply; if
-          the difference between the two turns admits no substitution at all,
-          there is nothing to rewrite and what is left is copying an answer to a
-          different question.  That is refused.
-
-        Only the candidates above the floor are scored for substitutions, so the
-        expensive part stays bounded.
+        Two gates: above the similarity floor, and with at least one substitution --
+        no rewrite possible would just copy an answer to a different question.
         """
         if not self.edit:
             return None
@@ -401,22 +316,10 @@ class QCache:
 
     # ---------------- replay ----------------
     def realize(self, match, new_turn: str, max_new: int, encode, decode):
-        """Turn a match into ``(tokens, text, info)``.
+        """Turn a match into ``(tokens, text, info)``, using ``encode`` and ``decode``.
 
-        ``encode`` maps text to token ids and ``decode`` maps a token id back to
-        text; the edit path needs both directions and they are not the same
-        function.
-
-        The returned tokens and text always describe the same reply.  When a
-        recorded reply is longer than the caller's budget it is cut to the budget
-        and the text is rebuilt from the surviving tokens -- and re-trimmed at a
-        stop marker, because the token stream of a reply that ended on its own
-        carries the stop token that the stored text had already had trimmed off.
-        Serving the tokens truncated while returning the full stored text is the
-        easy version of this and it desynchronises the two.
-
-        Without ``CC_QEDIT`` no trace is consulted; the reply is returned as
-        stored, possibly cut to the budget as above.
+        Tokens and text always describe the same reply: a shortened reply rebuilds
+        its text from the surviving tokens and re-trims at a stop marker.
         """
         entry = match.entry
         cut = min(max_new, len(entry.toks))
@@ -445,10 +348,8 @@ class QCache:
             self.st["edited"] += 1
             self.st["edit_applied"] += accepted
             self.st["edit_rejected"] += rejected
-            # Always rebuild from the token stream once an edit has been applied.
-            # A refused substitution falls back to the model's argmax inside
-            # _validate, so the edited string is no longer what the tokens say,
-            # and only the tokens are authoritative.
+            # Always rebuild from the tokens once an edit applied: a refused substitution
+            # falls back to the model's argmax, so only the tokens are authoritative.
             text = _trim(utext.whole(b"".join(decode(t) for t in toks)), entry.stopk)
         toks = toks[:max_new]
         info["saved"] = len(toks)
@@ -457,19 +358,10 @@ class QCache:
         return toks, text, info
 
     def _validate(self, trace: Trace, base: list, candidate: list):
-        """Align an edited token stream against the trace; keep only in-distribution edits.
+        """Align an edited token stream against the trace; returns ``(tokens, accepted, rejected)``.
 
-        Only *substitutions* are checked against the model's cached top-k.  Three
-        kinds of token are written without a check, and the caller's reports say
-        so rather than implying otherwise:
-
-        * a deletion -- removing text needs no distribution to justify;
-        * an insertion, and the tail of a replacement that grew -- there is no
-          cached row governing a position that did not exist;
-        * the fallback for a refused substitution, which is the model's own
-          argmax at that position.
-
-        Returns ``(tokens, accepted, rejected)``.
+        Only substitutions are checked against the cached top-k: deletions, insertions
+        and a grown replacement's tail have no cached row governing them.
         """
         sm = difflib.SequenceMatcher(a=base, b=candidate, autojunk=False)
         out, accepted, rejected = [], 0, 0
@@ -491,11 +383,8 @@ class QCache:
                     else:
                         out.append(base[i1 + n])
                         rejected += 1
-                # Only the candidate tail is carried over.  A base tail must NOT
-                # be re-appended: the candidate replaced the whole block, and
-                # keeping the base remainder splices tokens the edit deleted back
-                # into the reply -- measured as a word from the old reply
-                # reappearing in the middle of the edited one.
+                # Only the candidate tail is carried over: re-appending a base tail
+                # would splice tokens the edit deleted back into the reply.
                 if j2 - j1 > width:
                     out.extend(candidate[j1 + width:j2])
                     accepted += (j2 - j1) - width

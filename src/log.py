@@ -1,25 +1,9 @@
 # -*- coding: utf-8 -*-
 """One logger for the server, including llama.cpp's own C-level output.
 
-The problem
------------
-llama.cpp logs through its own C callback and by default writes straight to
-stderr, bypassing Python entirely.  On this model that means every decode prints
-CUDA graph lines -- measured at 28 of them per 30 decode steps, so tens of
-thousands over a session -- and the lines that actually matter get buried: a
-context that ran out of cells, a decode that failed, a batch that could not be
-initialised.  Those were the errors worth reading, and they were unreadable.
-
-The fix
--------
-``llama_log_set`` and ``ggml_log_set`` take a C callback, so both streams can be
-routed here.  Measured: the CUDA graph flood arrives at level 1 (DEBUG), which
-means a level threshold removes it without pattern-matching anything, and
-everything at INFO and above still reaches the console.
-
-Continuations (ggml level 5) are appended to the line before them rather than
-given a new timestamp, because that is what they are -- llama.cpp splits a
-single long message across several callbacks.
+llama.cpp logs through its own C callback and would write straight to stderr;
+``llama_log_set`` and ``ggml_log_set`` route both streams here instead.
+Continuation lines (ggml level 5) are appended to the line above them.
 
     CC_LOG=debug|info|warn|error|off     console and file threshold
     CC_LOG_CONSOLE=0                     file only
@@ -35,8 +19,7 @@ import time
 
 LEVELS = {"debug": 10, "info": 20, "warn": 30, "error": 40, "off": 100}
 
-# ggml_log_level: NONE=0 DEBUG=1 INFO=2 WARN=3 ERROR=4 CONT=5.  CONT is a
-# continuation of the previous message, not a message of its own.
+# ggml_log_level: NONE=0 DEBUG=1 INFO=2 WARN=3 ERROR=4; CONT=5 continues the previous message.
 GGML_LEVEL = {0: "debug", 1: "debug", 2: "info", 3: "warn", 4: "error"}
 CONT = 5
 
@@ -44,12 +27,10 @@ _lock = threading.Lock()
 _threshold = LEVELS[os.environ.get("CC_LOG", "info").lower()]
 _to_console = os.environ.get("CC_LOG_CONSOLE", "1") != "0"
 _path = None
-_cb = None            # the ctypes callback; the C side holds only a pointer, so
-                      # this reference is what keeps it from being collected
+_cb = None            # the ctypes callback; this reference keeps it from being collected
 
-# Colour goes to the console only -- the file is stripped on the way out (see
-# _emit), so a saved log stays greppable and diffable.  Off when the output is
-# redirected, when the terminal cannot do ANSI, or with CC_LOG_COLOR=0.
+# Console only: _emit strips ANSI from the file.  Off unless CC_LOG_COLOR is on,
+# stdout is a tty, and the terminal does ANSI.
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 COLOURS = {"dim": "2", "red": "31", "green": "32", "yellow": "33",
            "blue": "34", "magenta": "35", "cyan": "36", "grey": "90",
@@ -80,8 +61,7 @@ except Exception:
 
 
 def C(text, colour: str) -> str:
-    """Colour a fragment for the console.  A no-op when colour is off, so
-    callers never have to branch on it."""
+    """Colour a fragment for the console; a no-op when colour is off."""
     if not _color or not colour:
         return str(text)
     return f"\x1b[{COLOURS.get(colour, '0')}m{text}\x1b[0m"
@@ -128,14 +108,11 @@ def log(msg: str, level: str = "info", tag: str = "cc_srv"):
 
 # ---------------- llama.cpp / ggml ----------------
 def _on_ggml(level: int, text, _user):
-    """C callback for llama.cpp's own logging.
-
-    Called from llama.cpp's threads, so everything here must be cheap and must
-    not raise: an exception crossing back into C would take the process down.
-    """
+    """C callback for llama.cpp logging; must not raise (an exception would
+    cross back into C)."""
     try:
         if level == CONT:
-            # A continuation belongs to the line before it.
+            # Continuation line: no stamp or level, just indented under the last.
             _emit("    " + (text or b"").decode("utf-8", "replace").rstrip())
             return
         name = GGML_LEVEL.get(level, "debug")
@@ -151,12 +128,8 @@ def _on_ggml(level: int, text, _user):
 
 
 def capture_llama_log(log_fn=log):
-    """Route llama.cpp's logging through this module.
-
-    Installed as early as possible -- before the model is loaded -- because the
-    backend and model load emit a lot, and a callback installed afterwards
-    misses all of it.
-    """
+    """Route llama.cpp's logging through this module; call before the model loads
+    or the whole backend and model load is missed."""
     global _cb
     if _cb is not None:
         return False

@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
-"""ctypes bindings for llama.cpp -- only this layer touches the DLL, the two above never do.
+"""ctypes bindings for llama.cpp -- the only layer that touches the DLL.
 
-Struct names are one word where possible: Mp / Cp / Msg / Batch (no ModelParams / ContextParams).
-Field names were already short, so keep them: ctypes aligns by position+type, a rename changes nothing.
+Struct names are short: Mp / Cp / Msg / Batch.  Field names keep llama.cpp's
+own, since ctypes matches by position and type, not by name.
 """
 import ctypes as ct
 import os
 
 DLL = r"D:\test\Zz\NLC\tools\llama-server"
 GGUF = r"D:\AI-model\lmstudio-community\Qwythos-9B-v2-MTP-Q4_K_M\Qwythos-9B-v2-MTP-Q4_K_M.gguf"
-Q4_0 = 2   # KV quantization type. Also the source of the measured "engine output depends on how the KV was built"
+Q4_0 = 2   # KV quantization type (llama_quantize_type)
 
 
 class Mp(ct.Structure):
@@ -49,19 +49,15 @@ class Batch(ct.Structure):
 
 
 def bind():
-    """Load the DLL and pin down every function signature we need in one pass.
+    """Load the DLL and declare every function signature we need in one pass.
 
-    The trap with incomplete signatures: with no argtypes declared, llama_token_to_piece
-    makes ctypes truncate 64-bit pointers to int, raising
-    OverflowError: int too long to convert (hit this for real).
+    argtypes must be declared; without them ctypes truncates 64-bit pointers
+    to int.
     """
     g = ct.CDLL(os.path.join(DLL, "ggml.dll"), mode=ct.RTLD_GLOBAL)
     L = ct.CDLL(os.path.join(DLL, "llama.dll"))
-    # Route llama.cpp's own logging through ours BEFORE the backend loads.  By
-    # default it writes to stderr, which on this model means every decode prints
-    # CUDA graph lines -- tens of thousands a session -- and the messages that
-    # matter drown.  Installing the callback after this point would miss the
-    # whole backend and model load.
+    # Route llama.cpp's own logging through ours BEFORE the backend loads, or
+    # the whole backend and model load goes to stderr instead.
     try:
         import log as _log
         gb = None

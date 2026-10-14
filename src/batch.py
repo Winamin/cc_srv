@@ -1,39 +1,12 @@
 # -*- coding: utf-8 -*-
 """Batched generation: many requests, one forward pass per step.
 
-Why this exists
----------------
-Measured on the agent workload, the server was 97 % busy and the dialog was
-waiting on generation, not on caching: solving the time budget out of two runs
-gives ~3 380 tok/s of prefill against ~38.5 tok/s of decode, with decode 64 % of
-the server's time.  Five subagents issuing requests at once did not overlap --
-they queued behind one lock on one sequence, and each step read the whole 5.5 GB
-of weights to produce a single token.
-
-A 9B Q4 model's decode step is memory-bandwidth bound: the weights are read once
-per step no matter how many tokens the step contains.  So the same read can
-advance several sequences at once.  Measured here with three sequences in one
-batch: 15.9 ms/token each when run one after another, 6.7 ms/token each when run
-together -- and the probe verifies each sequence still produces exactly the
-tokens it would have produced alone.
-
-What this module is
--------------------
-A scheduler.  It owns the context, hands each active request its own sequence,
-advances every sequence that has work by one step, decodes all of them in a
-single llama_decode, and hands each sequence back the logits row that belongs to
-it.
-
-The KV-free cache layers stay outside it: ``Eng.probe`` answers the requests that
-need no forward pass at all before they ever reach a sequence, which is what
-keeps slots free for the requests that do.
-
-Correctness
------------
-Batching is only sound if a sequence's output does not depend on which other
-sequences shared its batches.  That is a property of the engine, not a hope, and
-``batch_probe.py`` measures it: sequences run in lockstep must produce exactly
-the tokens they produce alone.  Everything here assumes that has been checked.
+A scheduler thread owns the context: it gives every active request a sequence,
+advances each by one step, decodes all of them in a single llama_decode, and
+hands each sequence back the logits row that belongs to it. Batching is sound
+only if a sequence's output does not depend on its batchmates. The KV-free cache
+layers (Eng.probe) answer what they can before a request ever reaches a
+sequence, keeping slots free for the rest.
 """
 from __future__ import annotations
 
@@ -45,9 +18,8 @@ import spec
 import utext
 from eng import Progress
 
-# A step is only batched together with the steps either side of it, so the
-# scheduler needs to know nothing about prompts or stops beyond what a job
-# carries.
+# A step batches only with the steps either side of it, so the scheduler sees
+# nothing beyond what a job carries.
 PREFILL = "prefill"
 DECODE = "decode"
 DONE = "done"
@@ -65,13 +37,11 @@ class Job:
 
     def __init__(self, prompt, max_new, stop, turn=None, on_token=None,
                  on_serve=None):
-        # Called with each generated token's text as it is produced, so a caller
-        # can stream.  None means the reply is only available at the end.
+        # Each generated token's text as it is produced; None means the reply is
+        # only available at the end.
         self.on_token = on_token
-        # Called once, as soon as the serving layer is decided, with
-        # (reused, hit).  The scheduler knows this at admission -- long before
-        # the reply exists -- and the HTTP layer needs it that early because the
-        # usage it puts in message_start is what Claude Code records.
+        # Called once at admission with (reused, hit), long before the reply
+        # exists, because the HTTP layer needs it for message_start usage.
         self.on_serve = on_serve
         self.prompt = list(prompt)
         self.max_new = max_new
@@ -88,9 +58,8 @@ class Job:
         self.cursor = 0        # prefill progress
         self.prefilled = 0     # reused prefix + tokens forwarded
         self.reused = 0        # just the reused prefix
-        # The position where this prompt diverged from what its sequence held.
-        # The state there is the one a sibling branch will ask for, and the only
-        # moment it exists is while prefilling through it.
+        # Where this prompt diverges from what its sequence held: the state there
+        # is what a sibling branch asks for, and only prefill can capture it.
         self.arc_at = None
         self.arc_done = False
         # Speculative decoding, when CC_DDC_BATCH puts DDC in this scheduler.
@@ -106,31 +75,21 @@ class Job:
         # part is a verification pass and carries logits for every position.
         self.verifying = False
         self.stopped = None
-        # Wall time this request spent prefilling vs decoding.  Accumulated per
-        # job because a batch serves several at once: one llama_decode covers
-        # every part, so there is no separate clock to read and the engine-level
-        # counters cannot tell one request's prefill from its neighbours'.
+        # Wall time spent prefilling vs decoding, allocated by token share across the step.
         self.pf_s = 0.0
         self.gn_s = 0.0
-        # Wall time of this job's own archive restore.  The engine's global
-        # arc_s cannot be split across concurrent jobs, so the per-job figure
-        # is captured at the restore site in _admit and travels out through
-        # run_job's info.
+        # This job's own archive restore: the engine's arc_s cannot be split
+        # across concurrent jobs, so it is timed at the restore site in _admit.
         self.arc_s = 0.0
-        # Whether any step this job took part in also carried another job's
-        # part.  A shared step makes pf_s/gn_s a token-count allocation rather
-        # than a measurement of this request alone; the HTTP layer uses this to
-        # leave the prefill/decode split out of the request log.
+        # Whether a step of this job also carried another job's part: that makes
+        # pf_s/gn_s an allocation rather than a measurement, and the HTTP layer
+        # then leaves the prefill/decode split out of the request log.
         self.shared = False
         # This job's own prefill progress reporter, or None (see eng.Progress).
-        # Per job, not per engine: the scheduler advances several prefills in one
-        # step, so a shared reporter would attribute each job's chunks to whoever
-        # reported last.
+        # A shared one would attribute each job's chunks to whoever reported last.
         self.prog = None
-        # Incremental UTF-8 for this job's own token bytes.  Per job, not per
-        # scheduler: several jobs' tokens arrive interleaved from one step, and a
-        # shared decoder would splice one reply's partial character onto
-        # another's.  See utext and Batcher._emit.
+        # Incremental UTF-8 for this job's own token bytes (see utext). A shared
+        # decoder would splice one reply's partial character onto another's.
         self.dec = utext.decoder()
         self.done = threading.Event()
         self.result = None
@@ -138,12 +97,7 @@ class Job:
         self.t0 = time.time()
 
     def seal(self) -> str:
-        """Finalise the text: flush the decoder and return everything.
-
-        The flush is what turns a trailing partial character into the U+FFFD it
-        has to be.  Skipping it would DROP that character instead, which is a
-        quieter bug than the corruption this replaced.
-        """
+        """Flush the decoder (a trailing partial character becomes U+FFFD) and return the text."""
         self.text = "".join(self.raw) + self.dec.decode(b"", True)
         return self.text
 
@@ -155,65 +109,45 @@ class Job:
 class Batcher:
     """Runs several requests' forward passes as one.
 
-    A single scheduler thread owns the context.  Callers submit a job and wait on
-    its event; they never touch the context themselves.
+    A single scheduler thread owns the context; callers submit a job and wait
+    on its event, never touching the context themselves.
     """
 
     def __init__(self, eng, chunk=None, log=print, start=True):
         self.e = eng
         self.log = log
-        # Prefill is chunked so that a long prompt does not monopolise a step:
-        # chunking is what lets a request that is still prefilling share the
-        # batch with requests that are already decoding.
-        #
-        # Deliberately NOT tied to eng.bs any more.  It was bs // 4, which was
-        # the same thing as "a quarter of a step" only while bs was 512; raising
-        # n_batch to match LM Studio's 2048 would have quadrupled the chunk to
-        # 512 tokens, and a prefill that large is exactly the shape that produced
-        # the measured p90 of 199 s -- one arriving prompt eating the whole step
-        # while the sequences already decoding got nothing.  The step budget is
-        # what should scale with n_batch; the share any single prefill may take
-        # of it is a separate question, and CC_BATCH_CHUNK answers it directly.
+        # Prefill is chunked so that a long prompt does not monopolise a step: a
+        # request still prefilling then shares the batch with decoding ones.
+        # The share one prefill may take is CC_BATCH_CHUNK, deliberately not
+        # tied to eng.bs: a chunk that scales with n_batch starves the
+        # sequences already decoding.
         self.chunk = chunk or int(os.environ.get("CC_BATCH_CHUNK", "0") or 0) \
             or max(64, min(eng.bs // 4, 128))
-        # How much better the busy home worker's prefix must be before it is
-        # worth waiting for.  Waiting is not free: in a fan-out the home worker
-        # is often mid-generation, and a free worker holding almost as long a
-        # prefix should be taken instead.  Zero would mean "always wait for the
-        # longest"; a huge value would mean "never wait".
+        # CC_BATCH_WAIT: how much better a busy home worker's prefix must be
+        # before blocking for it beats taking a free worker.  Zero would mean
+        # "always wait for the longest"; a huge value "never wait".
         self.wait_margin = int(os.environ.get("CC_BATCH_WAIT", "512"))
-        # The archive keeps its states in sequences of its own.  Handing work to
-        # one of those would overwrite an archived state mid-flight, so the
-        # scheduler only ever uses the sequences the engine says are free.
+        # The archive keeps its states in sequences of its own, so the scheduler
+        # only uses the sequences the engine says are free (eng.work_seqs).
         self.seqs = list(getattr(eng, "work_seqs", None) or range(eng.nseq))
-        # DDC's verification sequences, if the layout reserved any.  They are not
-        # in ``seqs`` -- the engine keeps them out of work_seqs precisely so a
-        # scheduler cannot hand one out as somebody's main sequence -- and a job
-        # holds one for the whole of its reply, so the pool is a bound on how
-        # many requests may speculate at once rather than on correctness.
+        # DDC's verification sequences (eng.ddc_pool), kept out of work_seqs so
+        # a scheduler cannot hand one out as a main sequence.  A job holds one
+        # for its whole reply, so the pool bounds how many may speculate at once.
         self.ddc_pool = list(getattr(eng, "ddc_pool", None) or [])
         self.ddc_used = set()
         self.jobs: list[Job] = []
         self.queued: list[Job] = []
         self.lock = threading.Lock()
         # Guards the KV-free caches (lgc / ridx / qcache), which request threads
-        # read through Eng.probe while the scheduler thread writes them when a
-        # job is retired.  They are cheap and hit rarely enough that one lock
-        # around them costs nothing measurable.
-        #
-        # Eng.gen writes those same caches WITHOUT this lock, so the two serving
-        # paths must not be mixed.  srv.py picks one at startup -- run_job when a
-        # scheduler exists, Eng.gen otherwise -- and never both, which is what
-        # makes that safe.  Anything that starts calling Eng.gen while the
-        # scheduler is live would race on ridx.
+        # read through Eng.probe while the scheduler thread writes them.
+        # Eng.gen writes those same caches WITHOUT this lock, so srv.py picks one
+        # serving path at startup and never both; mixing them would race on ridx.
         self.state_lock = threading.Lock()
         self.wake = threading.Event()
         self.st = {"steps": 0, "batched_tokens": 0, "jobs": 0, "admitted": 0,
                    "peak_seq": 0}
         self._stop = False
-        # start=False lets the pure-Python scheduling logic be tested without a
-        # GPU: the state machine is where the interesting mistakes live, and it
-        # needs no model to exercise.
+        # start=False lets the pure-Python scheduling logic be tested without a GPU.
         self.thread = None
         if start:
             self.thread = threading.Thread(target=self._loop, daemon=True)
@@ -241,34 +175,17 @@ class Batcher:
     def _admit(self):
         """Move queued jobs onto free sequences, reusing a prefix if one fits.
 
-        Three different positions matter here and they are easy to conflate:
-
-        * ``usable`` -- how much of this prompt a sequence already holds as a
-          strict prefix.  That is the only part that can be reused in place: a
-          sequence holding MORE than the prompt would need its tail truncated
-          away, and a partial truncation is a no-op on this hybrid memory, so
-          such a sequence is cleared instead.
-        * ``diverged`` -- how far this prompt AGREES with what the sequence
-          holds, even when that cannot be reused.  That boundary is exactly
-          where a sibling branch will diverge too, so it is the state worth
-          archiving, and the prefill is asked to stop there on the way past.
-          It is not the same number as ``usable``, and using one for the other
-          is why an earlier version archived nothing at all.
-        * whatever the archive can offer, which is the only source of reuse
-          between two sibling subagents that share a prefix but are not
-          extensions of one another.
+        ``usable`` is the strict prefix a sequence already holds; ``diverged``
+        is how far the prompt agrees with it, which is the boundary worth
+        archiving.
         """
         with self.lock:
             pending, self.queued = self.queued, []
         for job in pending:
-            # A prompt that cannot fit one sequence must fail here, with a
-            # reason, rather than reach llama_decode.  A failed decode is not
-            # contained: it does not retire its job, only _retire writes
-            # seq_tokens, so the sequence is left holding tokens the ledger does
-            # not know about -- and the next request placed on it computes its
-            # reusable prefix from that stale ledger and decodes from the wrong
-            # position.  One over-long prompt would take down every request
-            # after it.
+            # A prompt too long for one sequence must fail here: a failed decode does
+            # not retire its job, and only _retire writes seq_tokens, so the
+            # sequence keeps tokens the ledger does not know about and the next
+            # request placed on it decodes from the wrong position.
             if len(job.prompt) > self.e.window:
                 job.error = ValueError(
                     f"prompt is {len(job.prompt)} tokens but a sequence holds "
@@ -278,15 +195,9 @@ class Batcher:
             busy = {j.seq for j in self.jobs if j.seq is not None}
             free = [s for s in self.seqs if s not in busy]
 
-            # Search EVERY worker, not just the free ones.
-            #
-            # The worker holding this prompt's history is the one worth using,
-            # and in a fan-out dialog it is usually busy -- a subagent is
-            # generating on it.  An earlier version looked only at free workers,
-            # so a request whose history sat on a busy one took a cold worker
-            # and paid a full prefill.  Measured: capture fell to 0.160, below
-            # the 0.241 of the single-sequence server it was meant to beat, and
-            # the archive could not cover it because it only had one slot.
+            # Search EVERY worker, not just the free ones: the one holding this
+            # prompt's history is usually busy, and taking it beats a cold
+            # prefill.
             home, usable, diverged = None, -1, 0
             alt, alt_usable = None, -1
             for s in self.seqs:
@@ -306,11 +217,8 @@ class Batcher:
                 best = home                     # free AND the longest: no choice
             elif alt is not None and (home is None
                                       or usable - alt_usable <= self.wait_margin):
-                # A free worker holds nearly as much of this prompt as the busy
-                # one does, so take it rather than block.  Always waiting for the
-                # longest prefix looks principled and is not: the home worker can
-                # be mid-generation for a long time, and a cold-ish worker that
-                # saves all but the last chunk beats an idle caller.
+                # A free worker holds nearly as much of this prompt as the busy one
+                # does, so take it rather than block.
                 best, usable = alt, alt_usable
             elif home is not None:
                 # Waiting for it is worth it: the alternative gives up a lot.
@@ -328,15 +236,13 @@ class Batcher:
             cur = self._seq_tokens(best)
             self._ddc_claim(job)
 
-            # Nothing on a sequence fits.  An archived state might: that is what
-            # the archive is for, and it is what a sibling subagent needs.
+            # Nothing on a sequence fits.  An archived state might.
             if self.e.arc is not None and usable < self.e.arc_min:
                 hit = self.e.arc_find(job.prompt)
                 if hit is not None and hit[1] > usable:
                     # Timed here rather than read off the engine's global arc_s:
-                    # while this restore runs, a concurrent admission may run
-                    # one too, and a delta of the shared counter would credit
-                    # this request with its neighbour's restore.
+                    # a concurrent admission's restore would be credited to this
+                    # request.
                     _t0 = time.perf_counter()
                     self.e.arc_restore(hit[0], best)
                     job.arc_s = time.perf_counter() - _t0
@@ -344,20 +250,16 @@ class Batcher:
                     self._start(job, hit[1], "arc")
                     continue
 
-            # A sequence has to be cleared before it can be decoded into, even a
-            # fresh one: one that has never been through seq_rm makes
-            # llama_decode fail with "failed to initialize batch", which reads
-            # like a malformed batch rather than an uninitialised sequence.
+            # A sequence must be cleared before decoding into it, even a fresh one:
+            # one that never went through seq_rm fails llama_decode with
+            # "failed to initialize batch".
             had = len(cur)
             if usable == 0 or usable < had:
                 self.e.clear_seq(best)
             if self.e.arc is not None:
-                # Archive at the start of the trailing user turn: that is the
-                # boundary every sibling of this request shares, and the state
-                # there is what they will all ask for.  Divergence from the
-                # worker's own contents is not that boundary -- in a fan-out the
-                # workers hold unrelated branches, so it is small and the archive
-                # would never learn where the shared part ends.
+                # Archive at the start of the trailing user turn: the boundary every
+                # sibling of this request shares.  Divergence from the worker's
+                # own contents is not that boundary.
                 at = self.e.turn_start(job.prompt)
                 if at is None or at <= usable:
                     at = diverged if diverged > usable else None
@@ -368,21 +270,7 @@ class Batcher:
     def _start(self, job, reused, how):
         """Put a job into prefill with ``reused`` tokens already in its sequence."""
         if reused >= len(job.prompt):
-            # The whole prompt is already in the sequence -- a worker happened to
-            # hold it, or an archived state restored to exactly its length.
-            # A decode step still needs a FRESH logits row for the last
-            # position, and an inherited or restored KV does not come with one
-            # (the logits buffer belongs to whatever decoded last), so the final
-            # token is forwarded again.  Rewriting a position with the token that
-            # is already there is safe, and one duplicated token costs nothing
-            # beside a full prefill.
-            #
-            # Leaving it at len(prompt) was a crash: the cursor already sat at
-            # the end, the prefill had nothing to forward, and the job was
-            # flipped to DECODE without a first token -- so the next step indexed
-            # out[-1] on an empty list.  The handler for that catches
-            # BaseException and clears every job in flight, so one narrow case
-            # would silently poison a whole run.
+            # A decode step needs a fresh logits row, so the last token is always re-forwarded.
             reused = max(0, len(job.prompt) - 1)
         job.cur = list(job.prompt[:reused])
         job.cursor = reused
@@ -394,22 +282,15 @@ class Batcher:
         self.e.st["pre"] += len(job.prompt) - reused
         if reused:
             self.e.st["apc"] += 1
-        # Report which layer actually served the prefix.  Every job used to say
-        # "batch", which made the hit histogram useless for telling an archive
-        # restore from an in-sequence reuse from a cold start -- and those are
-        # exactly the three outcomes the archive work is trying to move between.
+        # Tell an archive restore from an in-sequence reuse from a cold start.
         job.hit = ("batch_arc" if how == "arc"
                    else "batch_apc" if reused else "batch_cold")
-        # Progress for this job's prefill, sized by what it will actually
-        # forward.  ``reused`` has already been clamped above, so this is the
-        # same number _plan will drain: the cursor advances from reused to
-        # len(prompt), and the percentage is of that span.  Labelled with the
-        # sequence so concurrent prefills can be told apart in the log -- a
-        # fan-out runs several at once and they interleave line by line.
+        # Progress sized by what this job will still forward (cursor reused ->
+        # len(prompt)); labelled with the sequence because concurrent prefills
+        # interleave line by line in the log.
         job.prog = Progress(len(job.prompt) - reused, self.log, job.seq)
-        # Report the decision now, not at retirement.  Everything above happens
-        # before a single token of this request is produced, which is the whole
-        # reason the hook exists here rather than on the finished job.
+        # Report the serving decision now: it is known at admission, before a
+        # single token of this request exists.
         if job.on_serve is not None:
             job.on_serve(job.reused, job.hit)
         self.jobs.append(job)
@@ -424,34 +305,14 @@ class Batcher:
         return self.e.seq_tokens.get(seq, [])
 
     # ---------------- speculative decoding (CC_DDC_BATCH) ----------------
-    # DDC's round, as the scheduler sees it.  The serial path (ddc_decode.py)
-    # runs the same three movements -- copy the committed state aside, write the
-    # whole draft into the copy in one pass, keep the prefix the target model
-    # agreed with -- but it owns the context while it does, so it can issue the
-    # verification as its own decode.  Here the verification is a part of the
-    # step's batch like any other, which is the whole reason for the work: a
-    # verification pass is a forward pass, and a forward pass is what the
-    # scheduler exists to share.
-    #
-    # Two differences from the serial path, both deliberate:
-    #
-    #  * A round that is only PARTLY accepted is discarded rather than committed.
-    #    Committing it needs the accepted prefix re-decoded on the main sequence
-    #    (the scratch copy is all-or-nothing; hybrid memory cannot truncate it
-    #    back), which is a second forward pass and a second job state.  Dropping
-    #    the round instead leaves the main sequence exactly where it was, and the
-    #    governor is told it returned zero tokens -- so a draft length that
-    #    mostly lands half-way is dropped by the same gate that drops any other
-    #    losing bucket, and one that lands whole keeps its ~3x.
-    #  * The spec.py governor is global, so DDC jobs running concurrently share
-    #    one grace window and one set of buckets.  Its measurements are
-    #    per-round and add up either way; what they cannot do is attribute a
-    #    stand-down to one request rather than another.
+    # DDC's round, as the scheduler sees it: copy the committed state aside,
+    # write the whole draft into the copy in one pass, and commit only a fully
+    # accepted draft.  A partial round is dropped and reported to the spec.py
+    # governor as zero tokens returned, and its scratch is never committed.
     def _ddc_claim(self, job):
         """Give this job a scratch sequence to verify drafts on, if one is free.
 
-        A job that gets none is not a failure -- it decodes one token at a time,
-        exactly as it would with DDC off.  Speculation here is opportunistic.
+        A job that gets none is not a failure -- it decodes one token at a time.
         """
         e = self.e
         cache = getattr(e, "ddc", None)
@@ -481,16 +342,8 @@ class Batcher:
     def _index_and_offer(self, job, row, token):
         """Index a produced token against the row that predicted it, then offer a draft.
 
-        Both halves matter and they share one full-vocabulary scan.  The index is
-        the bootstrap of the whole feature: a draft is looked up in it, so a path
-        that never indexes never drafts -- and a round is the only other thing
-        that indexes, so a path that only indexed round tokens would never
-        produce a first one.  The first batched run did exactly that and
-        speculated zero rounds with a full pool.
-
-        The governor's per-token note is unconditional.  It is the repetition
-        detector, and it has to keep running while DDC is stood down or it could
-        never see the content turn repetitive and switch back on.
+        Both halves share one full-vocabulary scan; spec.note_token runs even
+        while DDC is stood down, being the repetition detector.
         """
         spec.note_token(token)
         if job.ddc is None:
@@ -501,10 +354,8 @@ class Batcher:
             return
         from ddc import features
         e = self.e
-        # Timed into the same counter the serial path reports it under.  This is
-        # the cost the gate's second half is about -- a full-vocabulary pass per
-        # committed token, measured at 7.9% of generation time -- and a batched
-        # run that left it at zero would make /stats claim the scan is free.
+        # Timed into the same counter the serial path (ddc_decode.py) reports
+        # it under, so /stats does not claim the scan is free.
         t0 = time.perf_counter()
         first = features(row)
         e.st["ddc_feature_s"] = e.st.get("ddc_feature_s", 0.0) + (
@@ -531,15 +382,9 @@ class Batcher:
     def _finish_round(self, job, first_idx):
         """Turn a verification pass into committed tokens.  -> (draft, committed).
 
-        Everything is read out of the logits rows before anything else runs: they
-        are views into the buffer the next step's decode overwrites, so the
-        accepted count, the next pending token and the per-position features all
-        have to be taken now.
-
-        The scan starts at one because a proposal's first token is the model's
-        own next token by construction -- ddc.propose refuses any trace whose
-        token at that position is not ``next_token`` -- so it is the one position
-        with nothing to verify, and the draft is written from it.
+        Read every logits row first: they are views into the buffer the next
+        decode overwrites.  The scan starts at one, because a proposal's first
+        token is the model's own next token (ddc.propose refuses any other).
         """
         from ddc import features
         e, L = self.e, self.e.L
@@ -553,14 +398,13 @@ class Batcher:
         accepted = draft[:count]
         pending = None
         if count == k:
-            # The copy IS the committed state now: one seq_cp moves it back and
-            # no forward pass is needed, which is where the ~3x comes from.
+            # The copy IS the committed state now: one seq_cp moves it back,
+            # and no forward pass is needed.
             L.llama_memory_seq_rm(e.kmem, job.seq, 0, -1)
             L.llama_memory_seq_cp(e.kmem, job.scratch, job.seq, 0, -1)
             pending = int(e.logits_row(first_idx + k - 1).argmax())
-        # Cleared whether or not the round was kept: the scratch never survives
-        # the round, and a rejected tail must not be left where the next round
-        # would copy from it.
+        # Cleared whether or not the round was kept: a rejected tail must not be
+        # left where the next round would copy from it.
         L.llama_memory_seq_rm(e.kmem, job.scratch, 0, -1)
         job.draft = None
         e.st["ddc_spec"] = e.st.get("ddc_spec", 0) + 1
@@ -568,51 +412,37 @@ class Batcher:
         e.st["ddc_acc1"] = e.st.get("ddc_acc1", 0) + (count == 1)
         e.st["ddc_tok"] = e.st.get("ddc_tok", 0) + count
         if count < k:
-            # Partial: given up, so nothing was committed, indexed or noted.  The
-            # only real token in the round is draft[0] -- this round's pending
-            # token, which the step that offered the draft already indexed
-            # against the row that predicted it -- and the rest never entered the
-            # sequence, so indexing them would teach later requests tokens this
-            # model never chose.
-            #
-            # The per-position features are NOT extracted either.  That scan is
-            # the fixed cost of a round, and a round being thrown away must not
-            # pay it, or the gate would compare a round's real cost against a
-            # number that left its largest term out.
+            # Partial: given up, so nothing was committed, indexed or noted -- only
+            # draft[0] is real, and the offering step already indexed it.  No
+            # per-position features either: a discarded round must not pay that
+            # scan, the largest term in a round's real cost.
             e.st["ddc_dropped"] = e.st.get("ddc_dropped", 0) + 1
             return k, 0
         # Kept: features for the committed positions, read while the rows are
-        # still live.  draft[0] is skipped -- see above, the previous step
-        # indexed it -- so this list pairs with accepted[1:].
+        # still live; draft[0] was indexed by the offering step, so this list
+        # pairs with accepted[1:].
         t_feat = time.perf_counter()
         descs = [features(e.logits_row(first_idx + i)) for i in range(count - 1)]
         e.st["ddc_feature_s"] = e.st.get("ddc_feature_s", 0.0) + (
             time.perf_counter() - t_feat)
-        # The whole draft is in the main sequence now.  cur takes all of it: that
-        # is what the KV holds.  out takes it one token at a time, alongside its
-        # text, because _emit decides max_new and the stop strings on the output
-        # it has already been given -- extending out first would let a round that
-        # crossed the limit finish the job with its own tokens unemitted.
+        # cur takes the whole draft, because that is what the KV holds; out takes
+        # it one token at a time so _emit applies max_new and the stop strings.
         job.cur.extend(accepted)
         job.pos += k
-        # Index the committed tokens against the features that preceded them.
-        # Only committed tokens go in: a rejected tail would poison the index
-        # with tokens this model never chose.
+        # Index the committed tokens against the features that preceded them: a
+        # rejected tail would poison the index with tokens this model never chose.
         for t, (ids, gaps) in zip(accepted[1:], descs):
             job.ddc.append(t, ids, gaps)
             spec.note_token(t)
-        # draft[0] is deliberately not emitted: it is the pending token out[-1]
-        # that this round just committed, and the batcher's ledger is
-        # cur == prompt + out[:-1], which appending it again would break.
+        # draft[0] is committed but not emitted: the ledger is cur == prompt + out[:-1].
         for t in accepted[1:]:
             job.out.append(t)
             self._emit(job, t)
             if job.state == DONE:
                 return k, count
         if job.pos >= e.window:
-            # The main sequence is full.  Stop here rather than let the next
-            # step decode one position past the cells, which fails the whole
-            # batch and every other request sharing it.
+            # The main sequence is full: decoding one position past the cells would
+            # fail the whole batch and every other request sharing it.
             job.stopped = None
             job.text = "".join(job.raw)
             job.finish()
@@ -620,9 +450,8 @@ class Batcher:
         job.out.append(pending)
         self._emit(job, pending)
         if job.state != DONE:
-            # The pending token is a produced token like any other: it gets
-            # indexed against the row that predicted it, and that is also where
-            # the next round's draft is looked up.
+            # A produced token like any other: indexed against the row that
+            # predicted it, which is also where the next round's draft is looked up.
             self._index_and_offer(job, e.logits_row(first_idx + k - 1), pending)
         return k, count
 
@@ -630,8 +459,7 @@ class Batcher:
         """Hand finished jobs back and free their sequences.
 
         Registering the trajectory happens here, on the scheduler thread, which
-        is why the KV-free caches are guarded: a request thread may be reading
-        them through Eng.probe at the same moment.
+        is why the KV-free caches are guarded against Eng.probe readers.
         """
         for j in list(self.jobs):
             if j.state != DONE:
@@ -647,19 +475,9 @@ class Batcher:
     def _plan(self):
         """One step's worth of work: a list of (seq, pos0, tokens, job) parts.
 
-        The budget is shared out in two passes, and the order is the whole point:
-
-        1. every sequence that is DECODING gets its one token, then
-        2. what is left is split between the sequences that are PREFILLING.
-
-        Draining the budget in one pass -- prefill first, in job order -- looked
-        reasonable and was badly wrong.  A request arriving with a 20 000-token
-        prompt would spend the entire step budget on its own prefill chunk, step
-        after step, and the sequences already generating got no token at all
-        until it finished.  Measured on a live dialog: p90 latency 199 s, and a
-        request that should have taken seconds took three minutes.  A decode
-        needs exactly one token and a caller is blocked on it; a prefill chunk is
-        arbitrary and can always be smaller, so prefill yields.
+        The budget is shared out in two passes: every sequence that is DECODING
+        gets its one token, then what is left is split between the sequences
+        that are PREFILLING.
         """
         live = [j for j in self.jobs if j.state != DONE]
         if not live:
@@ -667,6 +485,7 @@ class Batcher:
         budget = self.e.bs
         parts = []
 
+        # Decode first: a decode needs exactly one token and a caller is blocked on it, so prefill yields.
         decoding = [j for j in live if j.state == DECODE]
         for job in decoding:
             if budget < 1:
@@ -679,15 +498,10 @@ class Batcher:
                 budget -= len(job.draft)
                 continue
             if job.draft is not None:
-                # Not verified this step, and the job must not decode a token
-                # instead: the draft was proposed for the position the job is at
-                # NOW, and advancing it by one would leave the draft describing
-                # the wrong one.  The first token of a draft is never verified (a
-                # proposal always opens with the model's own next token), so a
-                # stale draft would commit that token unverified -- the draft
-                # goes, the decode stays.  Whichever of the two reasons brought
-                # us here (no scratch, or no budget for the whole draft), this is
-                # the only safe thing to do with it.
+                # Not verified this step, so the draft goes and the decode stays:
+                # a stale draft describes the wrong position, and its first token
+                # is never verified (a proposal opens with the model's own next
+                # token), so it would commit that token unverified.
                 job.draft = None
             job.verifying = False
             parts.append((job.seq, job.pos, [job.out[-1]], job))
@@ -702,17 +516,15 @@ class Batcher:
                 job.verifying = False
                 take = min(self.chunk, share, budget, len(job.prompt) - job.cursor)
                 if job.arc_at is not None and not job.arc_done:
-                    # Land the chunk exactly on the boundary so the state there
-                    # can be copied out; overshooting it loses the boundary for
-                    # good, because the KV can never come back.
+                    # Land the chunk exactly on arc_at so the state there can be
+                    # copied out; overshooting loses the boundary for good.
                     take = min(take, max(1, job.arc_at - job.cursor))
                 take = max(1, take)
                 toks = job.prompt[job.cursor:job.cursor + take]
                 if not toks:
-                    # Nothing left to forward.  That is only a legitimate
-                    # transition when there is a token to decode FROM; a job with
-                    # an empty output would make the next step index out[-1] on
-                    # nothing and take the whole batch down with it.
+                    # Nothing left to forward: only a job with a token to decode
+                    # FROM may end prefill, or the next step indexes out[-1] on
+                    # an empty list and takes the whole batch down.
                     if job.out:
                         job.state = DECODE
                     else:

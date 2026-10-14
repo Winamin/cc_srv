@@ -1,61 +1,17 @@
 # -*- coding: utf-8 -*-
 """Decide, per round, whether a speculative round is worth taking.
 
-What went wrong before
-----------------------
-The first version of this switched speculation off globally once it measured
-slower than plain decoding.  Measured against real traffic, that is the wrong
-shape of decision, because speculation is not uniformly good or bad -- it is
-good for some drafts and bad for others:
+A round pays a verification pass over the whole draft plus a refeed when the draft
+is only partly accepted, so a losing draft costs more than the tokens it returns.
+Rounds are therefore bucketed by draft length and each bucket's rate is measured
+against plain decoding; a bucket at or below the plain rate is dropped for a
+cooldown and then re-probed, with the cooldown doubling on each further failure.
 
-    prompt tok   ms/token   spec rounds   full accept   draft/round
-     18590        17.20          0            --            --
-     18803         5.64          4           100%          9.75
-     19534         5.68          3           100%         12.33
-     22631        18.00          0            --            --
-
-When a draft lands, a round is ~3x faster than decoding one token at a time.
-When it does not, the round costs MORE than the tokens it returns, and a global
-switch would have thrown away the 3x along with the loss.
-
-Where the loss comes from
--------------------------
-A round pays a verification pass over the whole draft, and then, unless the
-draft was accepted in full, a second pass to refeed the accepted prefix.  So a
-partially-accepted round costs two forward passes and returns its accepted
-count.  Against ~15.9 ms per token decoded one at a time:
-
-    draft   full accept   partial accept (1 kept)
-        2      1.8x              0.47x
-        4      2.5x              0.62x
-       16      5.5x              0.70x
-
-Short drafts are the problem: at m=2 a partial acceptance can never pay, and the
-recorded k2 corpus averaged 1.32 draft tokens per round with 19.8% full
-acceptance -- mostly the losing case, which is the whole of the measured 0.712x.
-k4, which barely speculates at all (0.47 verified per round), measured 0.962x.
-
-What this does instead
-----------------------
-Buckets rounds by draft length and measures each bucket's own rate against the
-plain decoding rate, which is measured from the rounds that do not speculate.
-A bucket whose rate falls to the plain rate stops being taken; the others carry
-on.  Nothing has to be predicted, because the engine is already timing both.
-
-A dropped bucket is not dropped for good
-----------------------------------------
-Conditions change: a session that was editing fresh code turns into one that
-re-reads the same file twenty times, and short drafts become the best kind
-again.  So a dropped bucket waits out a cooldown and is then re-measured from
-scratch, with the cooldown doubling each time it fails again -- a bucket that
-is genuinely bad costs one probe per doubling, and one that has merely hit a
-bad patch comes back on its own.
-
-    CC_SPEC_GOV=0        disable the gate (speculate whenever a draft exists)
-    CC_SPEC_MIN=12       ROUNDS of evidence on each side before judging
-    CC_SPEC_TAU=8.0      EWMA time constant, rounds
-    CC_SPEC_MARGIN=1.0   a bucket is dropped at or below this ratio
-    CC_SPEC_COOLDOWN=64  rounds before a dropped bucket is re-probed
+CC_SPEC_GOV=0        disable the gate (speculate whenever a draft exists)
+CC_SPEC_MIN=12       rounds of evidence on each side before judging
+CC_SPEC_TAU=8.0      EWMA time constant, rounds
+CC_SPEC_MARGIN=1.0   a bucket is dropped at or below this ratio
+CC_SPEC_COOLDOWN=64  rounds before a dropped bucket is re-probed
 """
 from __future__ import annotations
 
@@ -64,56 +20,28 @@ import os
 import threading
 from collections import deque
 
-# Both in ROUNDS, not seconds.  The decision is made per round, and a round is
-# milliseconds long -- 91 speculative rounds in a 16-request run is under a
-# second of evidence in total, which split across four buckets never reaches a
-# seconds-based threshold.  Measured: with a two-second threshold the gate never
-# fired once.
+# Units are rounds, not seconds: a round is milliseconds long.
 _TAU = float(os.environ.get("CC_SPEC_TAU", "8.0"))
 _MIN = float(os.environ.get("CC_SPEC_MIN", "12"))
 _MARGIN = float(os.environ.get("CC_SPEC_MARGIN", "1.0"))
 _COOLDOWN = float(os.environ.get("CC_SPEC_COOLDOWN", "64"))
 _ON = os.environ.get("CC_SPEC_GOV", "1") != "0"
 
-# The repetition detector.  The bucket gate below judges draft LENGTHS, and the
-# evidence it counts comes only from rounds where a draft was actually taken --
-# so on content that offers no drafts at all it never accumulates evidence and
-# never arms.  That is precisely the case it is needed for.
-#
-# It watches the TOKEN STREAM rather than DDC's own output, and it has to: the
-# full-vocabulary scan in ddc.features is not only the lookup, it is also what
-# feeds cache.append. A detector that measured draft length would be standing
-# down to save the very scan that builds the index the drafts come from, so the
-# index would freeze, offers would stay at zero, and the detector would confirm
-# itself -- the evidence and the cost are the same work.
-#
-# A rolling n-gram over the generated token stream breaks that circle: it costs
-# a tuple hash per token against a 248k-element argpartition (measured at 7.9% of
-# generation time), so it can gate the expensive index without depending on it,
-# and it keeps running while DDC is stood down.
-#
-# The signal is deliberately binary per token: an n-gram that occurred before
-# inside the window scores 1, otherwise 0. Novel prose scores near zero; a
-# repeated structure -- the case that pays -- scores near one once the first
-# copy has gone by.
+# The repetition detector must keep running while DDC is stood down, or it can
+# never see content turn repetitive.  It therefore scores a rolling n-gram over
+# the generated tokens: 1 if that n-gram was seen earlier inside the window.
 _REP_N = int(os.environ.get("CC_SPEC_REP_N", "32"))
 _REP_WINDOW = int(os.environ.get("CC_SPEC_REP_WINDOW", "4096"))
 # Fraction of recent tokens whose n-gram had been seen before.
 _REP_MIN = float(os.environ.get("CC_SPEC_REP_MIN", "0.15"))
 _REP_EVIDENCE = float(os.environ.get("CC_SPEC_REP_EVIDENCE", "64"))
 _REP_TAU = float(os.environ.get("CC_SPEC_REP_TAU", "32"))
-# Tokens of grace at the start of every generation, during which DDC is never
-# stood down.  A repetitive request always BEGINS novel: DDC drafts the second
-# copy of a structure from the first, so the first copy has to be indexed before
-# the repetition is visible at all.  Measured on the dataclass prompt, the rate
-# runs 0.00 at the start and reaches 0.35 only once a full class has gone by;
-# judging during that window stands down precisely the requests that pay.
+# Tokens of grace before judging starts: a repetitive request BEGINS novel, so
+# DDC must index the first copy before the repetition is visible at all.
 _REP_GRACE = int(os.environ.get("CC_SPEC_REP_GRACE", "128"))
 
-# Draft lengths are bucketed rather than tracked individually: neighbouring
-# lengths behave alike, and a bucket needs a dozen rounds of evidence before it
-# can be judged -- which an individual length would never accumulate, since a
-# single length can go many requests without recurring.
+# Draft lengths are bucketed: neighbouring lengths behave alike, and a single
+# length can go many requests without recurring, so it never gathers evidence.
 BUCKETS = ((2, 3), (4, 7), (8, 15), (16, 1 << 30))
 
 _lock = threading.Lock()
@@ -139,10 +67,8 @@ def _bucket_of(n: int) -> int:
 
 
 def _ewma(slot, value: float, tau: float = None):
-    """Fold one observation into ``slot``.  Seeded with the first observation
-    rather than zero: starting from zero takes ~TAU rounds to converge, and a
-    verdict is allowed after a fixed number of rounds, so a zero start means the
-    estimate is still far too low when the first verdict is reached."""
+    """Fold one observation into ``slot``; seeded with the first observation
+    rather than zero, because zero takes ~TAU rounds to converge."""
     if slot[1] == 0:
         slot[0] = value
     else:
@@ -152,8 +78,7 @@ def _ewma(slot, value: float, tau: float = None):
 
 
 def _note(bucket, tokens: int, seconds: float):
-    """One observation.  The rate is tokens per second of decode time; the
-    evidence is counted in rounds, because that is the unit being decided."""
+    """One observation: tokens per second of decode time, evidence in rounds."""
     global _round
     _round += 1
     if tokens <= 0 or seconds <= 0:
@@ -178,15 +103,9 @@ def begin_request():
 
 
 def note_token(token: int):
-    """Feed one generated token to the repetition detector.
-
-    Called for every committed token whether or not DDC is currently indexing,
-    which is the point: the signal has to keep working while DDC is stood down,
-    or it could never notice the content turning repetitive and switch back on.
-
-    Scores 1 when this token's n-gram was seen before inside the window, else 0.
-    Inside a repeat every token scores, so a repeated structure drives the rate
-    to ~1 while novel prose leaves it near 0.
+    """Feed one generated token to the repetition detector: scores 1 when its
+    n-gram was seen before inside the window, else 0.  Called for every committed
+    token, DDC indexing or not.
     """
     global _pos
     if not _ON:
@@ -202,9 +121,8 @@ def note_token(token: int):
         _seen[key] = _pos
         _ewma(_rep, 1.0 if (prev is not None and _pos - prev <= _REP_WINDOW) else 0.0,
               _REP_TAU)
-        # Bound the index: anything older than the window can no longer produce
-        # a hit, so drop it.  Done in a batch because a full scan per token would
-        # cost more than the hash it is cleaning up after.
+        # Bound the index: entries older than the window can no longer hit, and a
+        # batch scan is cheaper than one per token.
         if len(_seen) > _REP_WINDOW:
             cutoff = _pos - _REP_WINDOW
             for k in [k for k, v in _seen.items() if v < cutoff]:
@@ -214,9 +132,7 @@ def note_token(token: int):
 def note_offer(draft_len: int):
     """Report the draft a round was OFFERED, 0 when the lookup found none.
 
-    Diagnostic only -- the verdict below no longer rests on it, for the reason
-    given at the top: it is unavailable exactly when DDC is stood down, and it
-    costs the scan to produce.
+    Diagnostic only: it is unavailable exactly when DDC is stood down.
     """
     if not _ON:
         return
@@ -227,15 +143,9 @@ def note_offer(draft_len: int):
 def paying() -> bool:
     """Whether the content being generated is repetitive enough to index for.
 
-    The bucket gate in ``allow()`` decides per draft length; this decides whether
-    to build the draft index at all.  Indexing costs a full-vocabulary scan per
-    committed token (measured 7.9% of generation time) and pays off only where
-    drafts land, so on content that never repeats it is pure cost.
-
-    Judged instantaneously rather than through a cooldown: the signal is cheap
-    and keeps running while DDC is stood down, so it can simply say "repetitive
-    again" the moment that becomes true.  A cooldown would only delay the
-    recovery it exists to allow.
+    ``allow()`` judges draft length; this judges whether to build the index at
+    all, instantly and with no cooldown, since the signal keeps running while
+    DDC is stood down.
     """
     if not _ON:
         return True
@@ -256,14 +166,12 @@ def allow(draft_len: int) -> bool:
         if b[2]:
             if b[2] > _round:
                 return False
-            # Cooldown elapsed: forget the old verdict and measure again.  A
-            # bucket that fails again gets a longer wait; one that was only
-            # passing through a bad patch comes back.
+            # Cooldown elapsed: forget the verdict and re-measure, waiting longer
+            # each time it fails again.
             b[0] = b[1] = 0.0
             b[2] = 0
-        # With no plain-decoding sample there is nothing to compare against, so
-        # speculation runs -- refusing everything until evidence arrives would
-        # mean never gathering any.
+        # No plain-decoding sample to compare against: speculate, since refusing
+        # until evidence arrives would never gather any.
         if _seq[1] < _MIN or b[1] < _MIN or _seq[0] <= 0:
             return True
         if b[0] <= _seq[0] * _MARGIN:
@@ -276,9 +184,7 @@ def allow(draft_len: int) -> bool:
 def note_round(draft_len: int, committed: int, seconds: float):
     """Report a speculative round: what it returned against what it cost.
 
-    ``seconds`` should cover the whole round -- the state copy, the verification
-    pass, any refeed, and the feature extraction -- because all of it is paid for
-    this round's committed tokens and nothing else.
+    ``seconds`` must cover the whole round, state copy and refeed included.
     """
     if not _ON:
         return
@@ -312,7 +218,7 @@ def line() -> str:
 
 
 def reset():
-    """Forget everything -- for tests and for benchmarks needing a clean run."""
+    """Forget everything; for tests and runs that need a clean start."""
     with _lock:
         global _round, _pos
         _round = 0
